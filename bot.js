@@ -570,3 +570,8 @@ function handleCommand(body) {
       log(`[Cmd] Unknown command. Type .help`, colors.red);
   }
 }
+// Dummy Web Server for Render 24/7 Uptime
+const express = require('express');
+const app = express();
+app.get('/', (req, res) => res.send('Bot is Online and Running 24/7!'));
+app.listen(process.env.PORT || 3000, () => log('[+] Web Server Started for Cloud Hosting.'));
