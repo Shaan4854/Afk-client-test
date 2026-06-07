@@ -9,7 +9,8 @@
   "dependencies": {
     "mineflayer": "^4.20.1",
     "mineflayer-pathfinder": "^2.4.5",
-    "discord.js": "^14.14.1"
+    "discord.js": "^14.14.1",
+    "express": "^4.18.2"
   }
 }
 
