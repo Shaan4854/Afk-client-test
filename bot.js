@@ -189,6 +189,25 @@ function handleCommand(body, discordMsg) {
   };
 
   switch (cmd) {
+    case 'connect':
+      const newIp = args[0];
+      const newPort = parseInt(args[1]) || 25565;
+      if (!newIp) return reply('❌ IP nahi mili! Aise likhein: `.connect <ip> [port]`');
+      
+      reply(`🔄 Server badal raha hu... Connecting to **${newIp}:${newPort}**`);
+      CONFIG.host = newIp;
+      CONFIG.port = newPort;
+      
+      // Purane server se disconnect karo
+      bots.forEach(b => { try { b.quit(); } catch(e){} });
+      bots.length = 0; 
+      
+      // 2 second baad naye server me bhejo
+      setTimeout(() => {
+        createBot(CONFIG.baseUsername);
+      }, 2000);
+      break;
+
     case 'move':
       const subMove = (args[0] || '').toLowerCase();
       if (subMove === 'stop') { 
@@ -219,7 +238,7 @@ function handleCommand(body, discordMsg) {
       break;
       
     case 'help':
-      reply('**S+ Discord Commands:**\n`.move forward`, `.move stop`, `.move <x> <y> <z>`, `.attack`\n(Type normally to chat in-game)');
+      reply('**S+ Discord Commands:**\n`.connect <ip> <port>`\n`.move forward`, `.move stop`, `.move <x> <y> <z>`\n`.attack`\n(Type normally to chat in-game)');
       break;
 
     default:
