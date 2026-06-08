@@ -1,296 +1,519 @@
 'use strict';
 
 const mineflayer = require('mineflayer');
-const { pathfinder, Movements, goals: { GoalBlock, GoalFollow } } = require('mineflayer-pathfinder');
+const { pathfinder, Movements } = require('mineflayer-pathfinder');
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const express = require('express');
 
 // ===========================================================================
-// Cloud & Discord Config 
+// CONFIG
 // ===========================================================================
 const CONFIG = {
-  host: process.env.MC_HOST || '127.0.0.1', 
-  port: parseInt(process.env.MC_PORT) || 25565,
+  host: process.env.MC_HOST || '127.0.0.1',
+  port: Number.parseInt(process.env.MC_PORT, 10) || 25565,
   baseUsername: process.env.MC_USERNAME || 'CloudBot',
-  password: '', // Auto-Login password memory
-  threads: parseInt(process.env.THREADS) || 1,
+  password: '',
+  threads: Number.parseInt(process.env.THREADS, 10) || 1,
   joinDelay: 3,
-  version: '1.20.4', 
-  clientBrand: 'mcc',
-  autoEatThreshold: 19,
-  attackReach: 3.5,
+  version: '1.21.11', // USER REQUESTED: 1.21.11
+  clientBrand: 'vanilla',
+  autoEatThreshold: 18,
   discordToken: process.env.DISCORD_TOKEN || '',
   discordChannel: process.env.DISCORD_CHANNEL || ''
 };
 
-const bots = []; 
 const state = {
-  cameraEnabled: true, autoEatEnabled: true, autoRespawnEnabled: true,
-  antiAfkEnabled: false, bypassEnabled: true 
+  cameraEnabled: true,
+  autoEatEnabled: true,
+  autoRespawnEnabled: true,
+  antiAfkEnabled: false,
+  bypassEnabled: true
 };
 
-function log(msg) { console.log(msg); }
+const bots = [];
+let manualDisconnect = false;
+
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function safeReason(reason) {
+  if (!reason) return 'unknown';
+  if (typeof reason === 'string') return reason;
+  if (reason instanceof Error) return `${reason.name}: ${reason.message}`;
+  try {
+    return JSON.stringify(reason);
+  } catch {
+    return String(reason);
+  }
+}
+
+function getPrimaryBot() {
+  return bots.find(b => b && b.entity) || bots[0] || null;
+}
 
 // ===========================================================================
-// DISCORD BOT SETUP
+// DISCORD BOT
 // ===========================================================================
-const discordClient = new Client({ 
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] 
+const discordClient = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
 });
 
 if (CONFIG.discordToken) {
-  discordClient.login(CONFIG.discordToken).catch(err => log('[!] Discord Login Failed: ' + err.message));
+  discordClient.login(CONFIG.discordToken).catch(err => {
+    log(`[!] Discord login failed: ${err.message}`);
+  });
 } else {
-  log('[!] No Discord Token provided. Running without Discord.');
+  log('[!] No Discord token provided. Running without Discord integration.');
 }
 
 discordClient.on('ready', () => {
-  log(`[+] Discord Bot Online as ${discordClient.user.tag}!`);
+  log(`[+] Discord bot online as ${discordClient.user.tag}`);
 });
 
-discordClient.on('messageCreate', (message) => {
-  if (message.author.bot) return; 
-  if (message.channel.id !== CONFIG.discordChannel) return; 
+discordClient.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+  if (!CONFIG.discordChannel || message.channel.id !== CONFIG.discordChannel) return;
 
   const raw = message.content.trim();
-  
-  if (raw[0] === '.') {
-    handleCommand(raw.slice(1).trim(), message); 
-  } else {
-    bots.forEach(b => { if (b.entity) b.chat(raw); });
-    message.react('💬');
+  if (!raw) return;
+
+  if (raw.startsWith('.')) {
+    await handleCommand(raw.slice(1).trim(), message);
+    return;
   }
+
+  bots.forEach(bot => {
+    if (bot && bot.entity) {
+      try {
+        bot.chat(raw);
+      } catch (err) {
+        log(`[!] Failed to relay Discord chat to ${bot.username}: ${err.message}`);
+      }
+    }
+  });
+
+  try {
+    await message.react('💬');
+  } catch (_) {}
 });
 
 function sendToDiscord(msg) {
-  if (discordClient.isReady() && CONFIG.discordChannel) {
-    const channel = discordClient.channels.cache.get(CONFIG.discordChannel);
-    if (channel) channel.send(`\`[Minecraft]\` ${msg}`);
-  }
+  if (!CONFIG.discordChannel) return;
+  if (!discordClient.isReady || !discordClient.isReady()) return;
+
+  const channel = discordClient.channels.cache.get(CONFIG.discordChannel);
+  if (!channel) return;
+
+  channel.send(`\`[Minecraft]\` ${msg}`).catch(() => {});
 }
 
 // ===========================================================================
-// MINEFLAYER BOT LOGIC
+// MINEFLAYER BOT CREATION
 // ===========================================================================
 function createBot(botName) {
   const bot = mineflayer.createBot({
-    host: CONFIG.host, port: CONFIG.port, username: botName,
-    auth: 'offline', version: CONFIG.version, respawn: false 
+    host: CONFIG.host,
+    port: CONFIG.port,
+    username: botName,
+    auth: 'offline',
+    version: CONFIG.version, // Dynamic config version (1.21.11)
+    respawn: false,
+    hideErrors: false,
+    brand: CONFIG.clientBrand
   });
 
   bot.loadPlugin(pathfinder);
-  bots.push(bot); 
+  bot._timers = [];
+  bot._autoLogin = {
+    loginSent: false,
+    registerSent: false,
+    lastAt: 0
+  };
+  bot._isCleaningUp = false;
+
+  bots.push(bot);
+  log(`[~] Connecting ${botName} -> ${CONFIG.host}:${CONFIG.port} with version ${CONFIG.version}`);
 
   bot.once('spawn', () => {
-    log(`[+] ${botName} joined successfully`);
-    sendToDiscord(`🟩 **${botName}** server me join ho gaya hai!`);
-    
+    log(`[+] ${bot.username} joined successfully`);
+    sendToDiscord(`🟩 **${bot.username}** joined **${CONFIG.host}:${CONFIG.port}**`);
+
     const moves = new Movements(bot);
-    moves.allowSprinting = true; moves.canDig = false;
+    moves.allowSprinting = false;
+    moves.canDig = false;
     bot.pathfinder.setMovements(moves);
-    
+
     startAntiNaNLoop(bot);
     startHumanCamera(bot);
     startAntiAfk(bot);
-    startSonarBypass(bot); 
+    startSonarBypass(bot);
+    setupAutoEat(bot);
+  });
+
+  bot.on('messagestr', async (message) => {
+    log(`[CHAT:${bot.username}] ${message}`);
+    sendToDiscord(`**${bot.username}:** ${message}`);
+    await handleAutoLogin(bot, message);
+  });
+
+  bot.on('kicked', reason => {
+    const readable = safeReason(reason);
+    log(`[!] ${bot.username} kicked: ${readable}`);
+    sendToDiscord(`🟥 **${bot.username}** kicked: ${readable}`);
+  });
+
+  bot.on('error', err => {
+    log(`[!] ${bot.username} error: ${safeReason(err)}`);
   });
 
   bot.on('death', () => {
-    sendToDiscord(`💀 **${botName}** died!`);
-    if (state.autoRespawnEnabled) setTimeout(() => { if (bot) bot.spawn(); }, 1500);
+    sendToDiscord(`💀 **${bot.username}** died.`);
+    if (!state.autoRespawnEnabled) return;
+
+    setTimeout(() => {
+      try {
+        bot.respawn();
+      } catch (_) {}
+    }, 1500);
   });
 
-  setupAutoEat(bot);
+  bot.on('end', reason => {
+    const readable = safeReason(reason);
+    log(`[!] ${bot.username} disconnected: ${readable}`);
+    sendToDiscord(`🟥 **${bot.username}** disconnected: ${readable}`);
+    cleanupBot(bot);
 
-  if (bots.length === 1) {
-    bot.on('messagestr', (message) => { 
-      log(`[CHAT] ${message}`);
-      sendToDiscord(message);
-      
-      // AUTO-LOGIN SYSTEM
-      if (CONFIG.password) {
-        const msgLow = message.toLowerCase();
-        if (msgLow.includes('/login') || msgLow.includes('login with')) {
-          bot.chat(`/login ${CONFIG.password}`);
-        } else if (msgLow.includes('/register') || msgLow.includes('register with')) {
-          bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`);
-        }
-      }
-    });
+    if (manualDisconnect) return;
+
+    setTimeout(() => {
+      createBot(botName);
+    }, CONFIG.joinDelay * 1000);
+  });
+
+  return bot;
+}
+
+async function handleAutoLogin(bot, message) {
+  if (!CONFIG.password) return;
+  if (!message) return;
+
+  const msg = String(message).toLowerCase();
+  const now = Date.now();
+
+  if (now - bot._autoLogin.lastAt < 2500) return;
+
+  const needsRegister = [
+    '/register', 'register with', 'please register',
+    'use /register', 'register <password>', 'registrarse', 'registre-se'
+  ].some(x => msg.includes(x));
+
+  const needsLogin = [
+    '/login', 'login with', 'please login',
+    'use /login', 'log in with', 'logue-se'
+  ].some(x => msg.includes(x));
+
+  try {
+    if (needsRegister && !bot._autoLogin.registerSent) {
+      bot._autoLogin.lastAt = now;
+      bot._autoLogin.registerSent = true;
+      bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`);
+      sendToDiscord(`🔐 **${bot.username}** auto-register command sent.`);
+      await wait(1200);
+      bot.chat(`/login ${CONFIG.password}`);
+      sendToDiscord(`🔓 **${bot.username}** auto-login command sent after register.`);
+      return;
+    }
+
+    if (needsLogin && !bot._autoLogin.loginSent) {
+      bot._autoLogin.lastAt = now;
+      bot._autoLogin.loginSent = true;
+      bot.chat(`/login ${CONFIG.password}`);
+      sendToDiscord(`🔓 **${bot.username}** auto-login command sent.`);
+    }
+  } catch (err) {
+    log(`[!] Auto-login failed for ${bot.username}: ${err.message}`);
+  }
+}
+
+function cleanupBot(bot) {
+  if (!bot || bot._isCleaningUp) return;
+  bot._isCleaningUp = true;
+
+  if (Array.isArray(bot._timers)) {
+    for (const timer of bot._timers) clearInterval(timer);
+    bot._timers.length = 0;
   }
 
-  bot.on('end', (reason) => {
-    log(`[!] ${botName} disconnected: ${reason}`);
-    sendToDiscord(`🟥 **${botName}** disconnected! Reason: ${reason}. Reconnecting...`);
-    const index = bots.indexOf(bot);
-    if (index > -1) bots.splice(index, 1);
-    setTimeout(() => createBot(botName), CONFIG.joinDelay * 1000);
+  const index = bots.indexOf(bot);
+  if (index !== -1) bots.splice(index, 1);
+}
+
+function registerInterval(bot, fn, ms) {
+  const timer = setInterval(fn, ms);
+  bot._timers.push(timer);
+  return timer;
+}
+
+function reconnectAll(reasonText) {
+  manualDisconnect = true;
+  sendToDiscord(`🔄 Reconnecting bots... ${reasonText}`);
+
+  const snapshot = [...bots];
+  snapshot.forEach(bot => {
+    try {
+      bot.quit(reasonText);
+    } catch (_) {}
+    cleanupBot(bot);
   });
-}
 
-log(`\n[+] Starting Bot with ${CONFIG.threads} threads...`);
-for (let i = 0; i < CONFIG.threads; i++) {
+  bots.length = 0;
+
   setTimeout(() => {
-    let name = CONFIG.threads > 1 ? `${CONFIG.baseUsername}_${Math.random().toString(36).substring(2, 6)}` : CONFIG.baseUsername;
-    createBot(name);
-  }, i * CONFIG.joinDelay * 1000);
-}
-
-// ===========================================================================
-// FEATURES (AutoEat, Bypass, AntiAFK, Camera)
-// ===========================================================================
-function startSonarBypass(bot) {
-  setInterval(() => {
-    if (state.bypassEnabled && bot.entity) {
-      bot.setControlState('sneak', true);
-      setTimeout(() => bot.setControlState('sneak', false), Math.floor(Math.random() * 150) + 50);
+    manualDisconnect = false;
+    for (let i = 0; i < CONFIG.threads; i++) {
+      setTimeout(() => {
+        const name = CONFIG.threads > 1
+          ? `${CONFIG.baseUsername}_${Math.random().toString(36).slice(2, 6)}`
+          : CONFIG.baseUsername;
+        createBot(name);
+      }, i * CONFIG.joinDelay * 1000);
     }
-  }, Math.floor(Math.random() * 500) + 300);
-
-  setInterval(() => {
-    if (state.bypassEnabled && bot.entity) bot.swingArm('right'); 
-  }, Math.floor(Math.random() * 3000) + 1500);
+  }, 2000);
 }
 
+// ===========================================================================
+// FEATURES
+// ===========================================================================
 function startAntiNaNLoop(bot) {
   bot.on('physicsTick', () => {
     if (!bot.entity) return;
     const p = bot.entity.position;
-    if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) p.set(0, 64, 0);
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) {
+      p.set(0, 64, 0);
+    }
   });
 }
 
 function setupAutoEat(bot) {
   let eating = false;
+
   bot.on('physicsTick', async () => {
     if (!state.autoEatEnabled || eating || !bot.entity) return;
-    if (bot.food === undefined || bot.food >= CONFIG.autoEatThreshold) return;
-    const food = bot.inventory.items().find(item => item && item.name && ['apple', 'carrot', 'bread', 'potato', 'beef', 'porkchop', 'chicken', 'melon', 'steak'].some(h => item.name.toLowerCase().includes(h)));
+    if (typeof bot.food !== 'number' || bot.food >= CONFIG.autoEatThreshold) return;
+
+    const food = bot.inventory.items().find(item => {
+      if (!item?.name) return false;
+      const name = item.name.toLowerCase();
+      return [
+        'apple', 'carrot', 'bread', 'potato', 'baked_potato', 'beef',
+        'cooked_beef', 'porkchop', 'cooked_porkchop', 'chicken',
+        'cooked_chicken', 'melon', 'steak', 'mutton', 'cooked_mutton'
+      ].some(x => name.includes(x));
+    });
+
     if (!food) return;
+
     eating = true;
-    try { await bot.equip(food, 'hand'); await bot.consume(); } catch (err) {} finally { eating = false; }
+    try {
+      await bot.equip(food, 'hand');
+      await bot.consume();
+    } catch (_) {
+      // ignore
+    } finally {
+      eating = false;
+    }
   });
 }
 
 function startAntiAfk(bot) {
-  setInterval(() => {
-    if (state.antiAfkEnabled && bot.entity) {
-      bot.setControlState('jump', true);
-      setTimeout(() => bot.setControlState('jump', false), 300);
-    }
-  }, 30000);
+  registerInterval(bot, () => {
+    if (!state.antiAfkEnabled || !bot.entity) return;
+
+    bot.setControlState('jump', true);
+    setTimeout(() => {
+      try {
+        bot.setControlState('jump', false);
+      } catch (_) {}
+    }, 250);
+  }, 45000);
 }
 
 function startHumanCamera(bot) {
-  setInterval(() => {
-    if (state.cameraEnabled && bot.entity) bot.look(bot.entity.yaw + (Math.random() - 0.5), bot.entity.pitch, true);
-  }, 4500);
+  registerInterval(bot, () => {
+    if (!state.cameraEnabled || !bot.entity) return;
+
+    const yaw = bot.entity.yaw + (Math.random() - 0.5) * 0.25;
+    const pitch = Math.max(-0.35, Math.min(0.35, bot.entity.pitch + (Math.random() - 0.5) * 0.08));
+    bot.look(yaw, pitch, true).catch(() => {});
+  }, 7000);
+}
+
+function startSonarBypass(bot) {
+  registerInterval(bot, () => {
+    if (!state.bypassEnabled || !bot.entity) return;
+
+    bot.setControlState('sneak', true);
+    setTimeout(() => {
+      try {
+        bot.setControlState('sneak', false);
+      } catch (_) {}
+    }, 180);
+  }, 30000 + Math.floor(Math.random() * 15000)); 
+
+  registerInterval(bot, () => {
+    if (!state.bypassEnabled || !bot.entity) return;
+
+    try {
+      bot.swingArm('right');
+    } catch (_) {}
+  }, 45000 + Math.floor(Math.random() * 20000)); 
 }
 
 // ===========================================================================
-// COMMAND HANDLER (Master Remote via Discord)
+// DISCORD COMMANDS
 // ===========================================================================
-function handleCommand(body, discordMsg) {
-  const parts = body.split(/\s+/);
-  const cmd = (parts[0] || '').toLowerCase();
-  const args = parts.slice(1);
+async function handleCommand(body, discordMsg) {
+  const parts = body.split(/\s+/).filter(Boolean);
+  const cmd = (parts.shift() || '').toLowerCase();
+  const args = parts;
+  const currentBot = getPrimaryBot();
 
-  const reply = (text) => {
-    if (discordMsg) discordMsg.reply(text);
+  const reply = async text => {
+    if (discordMsg) {
+      try {
+        await discordMsg.reply(text);
+      } catch (_) {}
+    }
     log(`[Cmd Reply] ${text}`);
   };
 
-  const currentBot = bots[0];
-
   switch (cmd) {
-    case 'connect':
+    case 'connect': {
       const newIp = args[0];
-      const newPort = parseInt(args[1]) || 25565;
-      if (!newIp) return reply('❌ IP nahi mili! Aise likhein: `.connect <ip> [port]`');
-      
-      reply(`🔄 Server badal raha hu... Connecting to **${newIp}:${newPort}**`);
+      const newPort = Number.parseInt(args[1], 10) || 25565;
+      if (!newIp) return reply('❌ Usage: `.connect <ip> [port]`');
+
       CONFIG.host = newIp;
       CONFIG.port = newPort;
-      
-      bots.forEach(b => { try { b.quit(); } catch(e){} });
-      bots.length = 0; 
-      setTimeout(() => createBot(CONFIG.baseUsername), 2000);
+      await reply(`🔄 Reconnecting to **${CONFIG.host}:${CONFIG.port}** with version **${CONFIG.version}**`);
+      reconnectAll(`manual reconnect to ${CONFIG.host}:${CONFIG.port}`);
       break;
+    }
 
-    case 'name':
+    case 'name': {
       const newName = args[0];
-      if (!newName) return reply('❌ Naya naam nahi diya! Aise likhein: `.name <NayaNaam>`');
-      
-      reply(`🔄 Username badal raha hu... Naya naam: **${newName}**. Reconnecting...`);
+      if (!newName) return reply('❌ Usage: `.name <new_name>`');
+
       CONFIG.baseUsername = newName;
-      
-      bots.forEach(b => { try { b.quit(); } catch(e){} });
-      bots.length = 0; 
-      setTimeout(() => createBot(CONFIG.baseUsername), 2000);
+      await reply(`✅ Username updated to **${CONFIG.baseUsername}**. Reconnecting now...`);
+      reconnectAll(`username changed to ${CONFIG.baseUsername}`);
       break;
+    }
 
-    case 'password':
+    case 'password': {
       const newPass = args[0];
-      if (!newPass) return reply('❌ Password nahi diya! Aise likhein: `.password <NayaPassword>`');
-      
-      CONFIG.password = newPass;
-      reply('✅ Auto-Login password set ho gaya! Ab bot jab bhi join karega khud `/login` aur `/register` kar lega.');
-      break;
+      if (!newPass) return reply('❌ Usage: `.password <password>`');
 
-    case 'status':
-      if (!currentBot || !currentBot.entity) return reply('❌ Bot abhi Minecraft server me online nahi hai.');
-      
+      CONFIG.password = newPass;
+      await reply('✅ Auto-login password saved in memory. The bot will now use `/register` or `/login` automatically when prompted.');
+      break;
+    }
+
+    case 'status': {
+      if (!currentBot || !currentBot.entity) {
+        return reply('❌ Bot is not currently online in Minecraft.');
+      }
+
+      const pos = currentBot.entity.position;
       const statusEmbed = new EmbedBuilder()
-        .setColor(0x00FF00)
-        .setTitle('🤖 Bot Status Report')
+        .setColor(0x2ecc71)
+        .setTitle('🤖 Bot Status')
         .addFields(
-          { name: 'Username 📛', value: currentBot.username, inline: false },
-          { name: 'Health ❤️', value: `${Math.round(currentBot.health)} / 20`, inline: true },
-          { name: 'Food 🍖', value: `${Math.round(currentBot.food)} / 20`, inline: true },
-          { name: 'Location 📍', value: `X: ${Math.round(currentBot.entity.position.x)} | Y: ${Math.round(currentBot.entity.position.y)} | Z: ${Math.round(currentBot.entity.position.z)}`, inline: false }
+          { name: 'Username', value: currentBot.username || 'Unknown', inline: true },
+          { name: 'Health', value: `${Math.round(currentBot.health ?? 0)} / 20`, inline: true },
+          { name: 'Food', value: `${Math.round(currentBot.food ?? 0)} / 20`, inline: true },
+          { name: 'Coordinates', value: `X: ${Math.floor(pos.x)} | Y: ${Math.floor(pos.y)} | Z: ${Math.floor(pos.z)}`, inline: false },
+          { name: 'Server', value: `${CONFIG.host}:${CONFIG.port}`, inline: false },
+          { name: 'Version', value: CONFIG.version, inline: true }
         )
         .setTimestamp();
-        
-      if (discordMsg) discordMsg.channel.send({ embeds: [statusEmbed] });
-      break;
 
-    case 'inv':
-      if (!currentBot || !currentBot.entity) return reply('❌ Bot abhi Minecraft server me online nahi hai.');
-      
+      await discordMsg.channel.send({ embeds: [statusEmbed] });
+      break;
+    }
+
+    case 'inv': {
+      if (!currentBot || !currentBot.entity) {
+        return reply('❌ Bot is not currently online in Minecraft.');
+      }
+
       const items = currentBot.inventory.items();
-      let invText = items.map(item => `${item.count}x ${item.displayName}`).join('\n');
-      if (!invText) invText = 'Bag bilkul khali hai...';
+      let invText = items.length
+        ? items.map(item => `${item.count}x ${item.displayName}`).join('\n')
+        : 'Inventory is empty.';
+
+      if (invText.length > 3800) invText = `${invText.slice(0, 3800)}\n...`;
 
       const invEmbed = new EmbedBuilder()
-        .setColor(0x3498DB)
-        .setTitle('🎒 Inventory / Bag')
-        .setDescription(`\`\`\`\n${invText}\n\`\`\``);
-        
-      if (discordMsg) discordMsg.channel.send({ embeds: [invEmbed] });
-      break;
+        .setColor(0x3498db)
+        .setTitle(`🎒 Inventory - ${currentBot.username}`)
+        .setDescription(`\`\`\`\n${invText}\n\`\`\``)
+        .setTimestamp();
 
-    case 'move':
-    case 'attack':
-      reply('⚙️ Movement & Attack features enabled (Check .help)');
+      await discordMsg.channel.send({ embeds: [invEmbed] });
       break;
-      
-    case 'help':
+    }
+
+    case 'help': {
       const helpEmbed = new EmbedBuilder()
-        .setColor(0xF1C40F)
-        .setTitle('🎮 Master Remote Commands')
-        .setDescription('**Server Setup:**\n`.name <NayaNaam>` - Bot ka naam badlo\n`.password <12345>` - Auto-Login password set karo\n`.connect <ip> <port>` - Kisi bhi server pe bhejo\n\n**Bot Info:**\n`.status` - Health & Location dekho\n`.inv` - Inventory check karo\n\n*(Bina dot "." ke type karoge toh Minecraft me chat jayegi)*');
-      
-      if (discordMsg) discordMsg.channel.send({ embeds: [helpEmbed] });
+        .setColor(0xf1c40f)
+        .setTitle('🎮 Discord Commands')
+        .setDescription([
+          '`.connect <ip> [port]` - change server and reconnect',
+          '`.name <new_name>` - change Minecraft username and reconnect',
+          '`.password <password>` - store auto-login password in memory',
+          '`.status` - show bot health, food and coordinates',
+          '`.inv` - show current inventory',
+          '',
+          'Any message without a dot is forwarded to Minecraft chat.'
+        ].join('\n'));
+
+      await discordMsg.channel.send({ embeds: [helpEmbed] });
       break;
+    }
 
     default:
-      reply('❌ Unknown command. Type `.help` for the command list.');
+      await reply('❌ Unknown command. Use `.help` to view available commands.');
   }
 }
 
 // ===========================================================================
-// DUMMY WEB SERVER FOR RENDER 24/7
+// STARTUP
 // ===========================================================================
-const express = require('express');
+log(`[+] Starting ${CONFIG.threads} bot instance(s)...`);
+for (let i = 0; i < CONFIG.threads; i++) {
+  setTimeout(() => {
+    const name = CONFIG.threads > 1
+      ? `${CONFIG.baseUsername}_${Math.random().toString(36).slice(2, 6)}`
+      : CONFIG.baseUsername;
+    createBot(name);
+  }, i * CONFIG.joinDelay * 1000);
+}
+
+// ===========================================================================
+// SIMPLE WEB SERVER FOR HOSTING PLATFORMS
+// ===========================================================================
 const app = express();
-app.get('/', (req, res) => res.send('Bot is Online and Running 24/7!'));
-app.listen(process.env.PORT || 3000, () => log('[+] Web Server Started for Cloud Hosting.'));
+app.get('/', (_req, res) => res.send('Bot is online and running.'));
+app.listen(process.env.PORT || 3000, () => {
+  log('[+] Web server started for cloud hosting.');
+});
