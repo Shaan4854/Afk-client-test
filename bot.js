@@ -6,18 +6,18 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const express = require('express');
 
 // ===========================================================================
-// CONFIGURATION (100% Checked)
+// CONFIGURATION 
 // ===========================================================================
-const CONFIG = {
-  host: process.env.MC_HOST || '34.131.199.250',
+let CONFIG = {
+  host: process.env.MC_HOST || '127.0.0.1',
   port: Number.parseInt(process.env.MC_PORT, 10) || 25565,
   baseUsername: process.env.MC_USERNAME || 'CloudBot',
-  password: '', // Memory for auto-login
+  password: '', 
   threads: Number.parseInt(process.env.THREADS, 10) || 1,
   joinDelay: 3,
-  version: false, // AUTO-DETECT: Best for Laptop/Java players
-  clientBrand: 'mcc', // Restored original bypass brand
-  autoEatThreshold: 19, // Restored original threshold
+  version: false, 
+  clientBrand: 'mcc', 
+  autoEatThreshold: 19, 
   attackReach: 3.5, 
   discordToken: process.env.DISCORD_TOKEN || '',
   discordChannel: process.env.DISCORD_CHANNEL || ''
@@ -32,7 +32,11 @@ const state = {
 };
 
 const bots = [];
-let manualDisconnect = false;
+let manualDisconnect = true; 
+
+// Reconnect Storm Protection Variables
+let reconnectAttempts = 0;
+const MAX_RECONNECTS = 5;
 
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 
@@ -60,7 +64,7 @@ if (CONFIG.discordToken) {
   discordClient.login(CONFIG.discordToken).catch(err => log(`[!] Discord login failed: ${err.message}`));
 }
 
-discordClient.on('ready', () => log(`[+] Discord bot online as ${discordClient.user.tag}`));
+discordClient.on('ready', () => log(`[+] Discord bot online as ${discordClient.user.tag}. Waiting for .connect command...`));
 
 discordClient.on('messageCreate', async (message) => {
   if (message.author.bot) return;
@@ -74,7 +78,6 @@ discordClient.on('messageCreate', async (message) => {
     return;
   }
 
-  // Forward chat to Minecraft
   bots.forEach(bot => {
     if (bot && bot.entity) {
       try { bot.chat(raw); } catch (err) { log(`[!] Chat relay failed: ${err.message}`); }
@@ -90,7 +93,7 @@ function sendToDiscord(msg) {
 }
 
 // ===========================================================================
-// MINEFLAYER BOT LOGIC
+// MINEFLAYER BOT CREATION & LOGIC
 // ===========================================================================
 function createBot(botName) {
   const bot = mineflayer.createBot({
@@ -105,9 +108,10 @@ function createBot(botName) {
   bot._isCleaningUp = false;
 
   bots.push(bot);
-  log(`[~] Connecting ${botName} -> ${CONFIG.host}:${CONFIG.port}`);
+  log(`[~] Connecting ${botName} -> ${CONFIG.host}:${CONFIG.port} (Attempt ${reconnectAttempts + 1}/${MAX_RECONNECTS})`);
 
   bot.once('spawn', () => {
+    reconnectAttempts = 0; // Reset counter on successful spawn
     log(`[+] ${bot.username} joined successfully`);
     sendToDiscord(`🟩 **${bot.username}** joined **${CONFIG.host}:${CONFIG.port}**`);
 
@@ -133,6 +137,10 @@ function createBot(botName) {
     sendToDiscord(`🟥 **${bot.username}** kicked: ${safeReason(reason)}`);
   });
 
+  bot.on('error', err => {
+    log(`[!] ${bot.username} error: ${safeReason(err)}`);
+  });
+
   bot.on('death', () => {
     sendToDiscord(`💀 **${bot.username}** died.`);
     if (state.autoRespawnEnabled) setTimeout(() => { try { bot.respawn(); } catch (_) {} }, 1500);
@@ -142,7 +150,17 @@ function createBot(botName) {
     log(`[!] ${bot.username} disconnected: ${safeReason(reason)}`);
     sendToDiscord(`🟥 **${bot.username}** disconnected: ${safeReason(reason)}`);
     cleanupBot(bot);
-    if (!manualDisconnect) setTimeout(() => createBot(botName), CONFIG.joinDelay * 1000);
+
+    if (!manualDisconnect) {
+      reconnectAttempts++;
+      if (reconnectAttempts >= MAX_RECONNECTS) {
+        log(`[!] Max reconnect attempts reached. Stopping auto-reconnect.`);
+        sendToDiscord(`🚨 **Emergency Stop:** Server is continuously disconnecting the bot. Reached max retries (${MAX_RECONNECTS}/${MAX_RECONNECTS}). Auto-reconnect disabled to prevent ban/storm. Type \`.connect\` to manually try again later.`);
+        manualDisconnect = true; 
+      } else {
+        setTimeout(() => createBot(botName), CONFIG.joinDelay * 1000);
+      }
+    }
   });
 
   return bot;
@@ -170,6 +188,7 @@ async function handleAutoLogin(bot, message) {
       bot.chat(`/login ${CONFIG.password}`);
       return;
     }
+
     if (needsLogin && !bot._autoLogin.loginSent) {
       bot._autoLogin.lastAt = now; bot._autoLogin.loginSent = true;
       bot.chat(`/login ${CONFIG.password}`);
@@ -181,8 +200,10 @@ async function handleAutoLogin(bot, message) {
 function cleanupBot(bot) {
   if (!bot || bot._isCleaningUp) return;
   bot._isCleaningUp = true;
+  
   for (const timer of bot._timers) clearInterval(timer);
   bot._timers.length = 0;
+  
   const index = bots.indexOf(bot);
   if (index !== -1) bots.splice(index, 1);
 }
@@ -194,20 +215,23 @@ function registerInterval(bot, fn, ms) {
 
 function reconnectAll(reasonText) {
   manualDisconnect = true;
-  sendToDiscord(`🔄 Reconnecting bots... ${reasonText}`);
+  reconnectAttempts = 0; // Reset counter for manual reconnection
+  sendToDiscord(`⏳ Disconnecting... ${reasonText}. Waiting 10 seconds to clear ghost players...`);
+  
   [...bots].forEach(bot => { try { bot.quit(reasonText); } catch (_) {} cleanupBot(bot); });
   bots.length = 0;
 
   setTimeout(() => {
     manualDisconnect = false;
+    sendToDiscord(`🚀 Reconnecting now...`);
     for (let i = 0; i < CONFIG.threads; i++) {
       setTimeout(() => createBot(CONFIG.baseUsername), i * CONFIG.joinDelay * 1000);
     }
-  }, 2000);
+  }, 10000); 
 }
 
 // ===========================================================================
-// FEATURES (Bypass, AntiAFK, Camera, AutoEat)
+// FEATURES 
 // ===========================================================================
 function startAntiNaNLoop(bot) {
   bot.on('physicsTick', () => {
@@ -219,10 +243,25 @@ function startAntiNaNLoop(bot) {
 
 function setupAutoEat(bot) {
   let eating = false;
+  
+  // Safe Edible Foods (Removed spider_eye to avoid poisoning)
+  const EDIBLE_FOODS = [
+    'golden_carrot', 'golden_apple', 'enchanted_golden_apple', 'steak', 
+    'cooked_porkchop', 'cooked_mutton', 'cooked_salmon', 'cooked_beef',
+    'carrot', 'potato', 'baked_potato', 'bread', 'cooked_chicken', 
+    'cooked_cod', 'cooked_rabbit', 'mushroom_stew', 'rabbit_stew', 
+    'beetroot_soup', 'apple', 'melon_slice', 'sweet_berries', 
+    'glow_berries', 'dried_kelp'
+  ];
+
   bot.on('physicsTick', async () => {
     if (!state.autoEatEnabled || eating || !bot.entity || bot.food >= CONFIG.autoEatThreshold) return;
-    const food = bot.inventory.items().find(item => item?.name && ['apple', 'carrot', 'bread', 'potato', 'beef', 'porkchop', 'chicken', 'melon', 'steak'].some(x => item.name.toLowerCase().includes(x)));
+    
+    const food = bot.inventory.items().find(item => 
+      item?.name && EDIBLE_FOODS.some(foodName => item.name.toLowerCase().includes(foodName))
+    );
     if (!food) return;
+
     eating = true;
     try { await bot.equip(food, 'hand'); await bot.consume(); } catch (_) {} finally { eating = false; }
   });
@@ -276,19 +315,48 @@ async function handleCommand(body, discordMsg) {
 
   switch (cmd) {
     case 'connect':
-      const newIp = args[0];
-      const newPort = Number.parseInt(args[1], 10) || 25565;
-      if (!newIp) return reply('❌ Usage: `.connect <ip> [port]`');
-      CONFIG.host = newIp; CONFIG.port = newPort;
-      await reply(`🔄 Reconnecting to **${CONFIG.host}:${CONFIG.port}**`);
-      reconnectAll(`manual reconnect`);
+      const newIp = args[0] || CONFIG.host;
+      const newPort = Number.parseInt(args[1], 10) || CONFIG.port;
+      
+      CONFIG.host = newIp; 
+      CONFIG.port = newPort;
+      manualDisconnect = false;
+      reconnectAttempts = 0; // Reset counter
+
+      if (bots.length > 0) {
+        await reply('⏳ Purane bots ko nikal raha hu. 10 seconds wait karein (Ghost player issue fix)...');
+        [...bots].forEach(b => { try { b.quit(); } catch (_) {} cleanupBot(b); });
+        bots.length = 0;
+        await wait(10000); 
+      }
+
+      await reply(`🚀 Connecting to **${CONFIG.host}:${CONFIG.port}**...`);
+      for (let i = 0; i < CONFIG.threads; i++) {
+        setTimeout(() => createBot(CONFIG.baseUsername), i * CONFIG.joinDelay * 1000);
+      }
+      break;
+
+    case 'quit':
+    case 'disconnect':
+      if (bots.length === 0) return reply('❌ Bot is already offline.');
+      
+      manualDisconnect = true; 
+      [...bots].forEach(b => { try { b.quit('Disconnected by Master Remote'); } catch (_) {} cleanupBot(b); });
+      bots.length = 0;
+      
+      await reply('🛑 Bot disconnected successfully. Use `.connect` to join again.');
       break;
 
     case 'name':
       if (!args[0]) return reply('❌ Usage: `.name <new_name>`');
       CONFIG.baseUsername = args[0];
-      await reply(`✅ Username updated to **${CONFIG.baseUsername}**. Reconnecting...`);
-      reconnectAll(`username changed`);
+      
+      if (bots.length === 0) {
+        await reply(`✅ Username updated to **${CONFIG.baseUsername}**.`);
+      } else {
+        await reply(`✅ Username updated to **${CONFIG.baseUsername}**. Reconnecting...`);
+        reconnectAll(`username changed`);
+      }
       break;
 
     case 'password':
@@ -306,7 +374,9 @@ async function handleCommand(body, discordMsg) {
           { name: 'Username', value: currentBot.username || 'Unknown', inline: true },
           { name: 'Health', value: `${Math.round(currentBot.health ?? 0)} / 20 ❤️`, inline: true },
           { name: 'Food', value: `${Math.round(currentBot.food ?? 0)} / 20 🍖`, inline: true },
-          { name: 'Location', value: `X: ${Math.floor(pos.x)} | Y: ${Math.floor(pos.y)} | Z: ${Math.floor(pos.z)} 📍`, inline: false }
+          { name: 'Location', value: `X: ${Math.floor(pos.x)} | Y: ${Math.floor(pos.y)} | Z: ${Math.floor(pos.z)} 📍`, inline: false },
+          { name: 'Server', value: `${CONFIG.host}:${CONFIG.port}`, inline: true },
+          { name: 'Retries', value: `${reconnectAttempts}/${MAX_RECONNECTS}`, inline: true }
         ).setTimestamp();
       await discordMsg.channel.send({ embeds: [statusEmbed] });
       break;
@@ -358,7 +428,23 @@ async function handleCommand(body, discordMsg) {
     case 'help':
       const helpEmbed = new EmbedBuilder()
         .setColor(0xf1c40f).setTitle('🎮 Master Remote Commands')
-        .setDescription('**Setup:** `.name <name>`, `.password <pass>`, `.connect <ip>`\n**Info:** `.status`, `.inv`\n**Action:** `.move forward/stop/<x> <y> <z>`, `.attack`');
+        .setDescription([
+          '**Server Control:**',
+          '`.connect` (or `.connect <ip>`) - Connect to server',
+          '`.quit` - Disconnect from server',
+          '`.name <new_name>` - Change bot username',
+          '`.password <password>` - Set auto-login password',
+          '',
+          '**Bot Status:**',
+          '`.status` - View Health/Food/Coordinates/Retries',
+          '`.inv` - View Inventory',
+          '',
+          '**Action:**',
+          '`.move forward` | `.move stop` | `.move <x> <y> <z>`',
+          '`.attack` - Attack nearby entities',
+          '',
+          '*(Messages without "." are forwarded to Minecraft chat)*'
+        ].join('\n'));
       await discordMsg.channel.send({ embeds: [helpEmbed] });
       break;
 
@@ -368,17 +454,13 @@ async function handleCommand(body, discordMsg) {
 }
 
 // ===========================================================================
-// STARTUP
+// STARTUP 
 // ===========================================================================
-log(`[+] Starting ${CONFIG.threads} bot instance(s)...`);
-for (let i = 0; i < CONFIG.threads; i++) {
-  setTimeout(() => createBot(CONFIG.baseUsername), i * CONFIG.joinDelay * 1000);
-}
+log(`[+] Discord Web Server is Online. Waiting for '.connect' command to join Minecraft...`);
 
 // ===========================================================================
 // WEB SERVER
 // ===========================================================================
 const app = express();
-app.get('/', (_req, res) => res.send('Bot is online!'));
+app.get('/', (_req, res) => res.send('Discord Master Remote is Online! Waiting for connect command.'));
 app.listen(process.env.PORT || 3000, () => log('[+] Web server started.'));
-  
