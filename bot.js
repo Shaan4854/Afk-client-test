@@ -9,13 +9,13 @@ const express = require('express');
 // CONFIGURATION (100% Checked)
 // ===========================================================================
 const CONFIG = {
-  host: process.env.MC_HOST || '127.0.0.1',
+  host: process.env.MC_HOST || '34.131.199.250',
   port: Number.parseInt(process.env.MC_PORT, 10) || 25565,
   baseUsername: process.env.MC_USERNAME || 'CloudBot',
   password: '', // Memory for auto-login
   threads: Number.parseInt(process.env.THREADS, 10) || 1,
   joinDelay: 3,
-  version: false, // AUTO-DETECT: Best for Laptop/Java players
+  version: 1.21.11, // AUTO-DETECT: Best for Laptop/Java players
   clientBrand: 'mcc', // Restored original bypass brand
   autoEatThreshold: 19, // Restored original threshold
   attackReach: 3.5, 
