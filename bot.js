@@ -6,7 +6,7 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const express = require('express');
 
 // ===========================================================================
-// CONFIGURATION 
+// CONFIGURATION (Rule 5: Let used for safe mutability)
 // ===========================================================================
 let CONFIG = {
   host: process.env.MC_HOST || '127.0.0.1',
@@ -15,10 +15,11 @@ let CONFIG = {
   password: '', 
   threads: Number.parseInt(process.env.THREADS, 10) || 1,
   joinDelay: 3,
-  version: false, 
+  version: false, // AUTO-DETECT
   clientBrand: 'mcc', 
   autoEatThreshold: 19, 
   attackReach: 3.5, 
+  prefix: '.', 
   discordToken: process.env.DISCORD_TOKEN || '',
   discordChannel: process.env.DISCORD_CHANNEL || ''
 };
@@ -33,10 +34,18 @@ const state = {
 
 const bots = [];
 let manualDisconnect = true; 
-
-// Reconnect Storm Protection Variables
-let reconnectAttempts = 0;
+let isConnecting = false; 
 const MAX_RECONNECTS = 5;
+
+// Complete Safe Food Database (Rule 2: Spider eye excluded)
+const EDIBLE_FOODS = [
+  'golden_carrot', 'golden_apple', 'enchanted_golden_apple', 'steak', 
+  'cooked_porkchop', 'cooked_mutton', 'cooked_salmon', 'cooked_beef',
+  'carrot', 'potato', 'baked_potato', 'bread', 'cooked_chicken', 
+  'cooked_cod', 'cooked_rabbit', 'mushroom_stew', 'rabbit_stew', 
+  'beetroot_soup', 'apple', 'melon_slice', 'sweet_berries', 
+  'glow_berries', 'dried_kelp'
+];
 
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 
@@ -64,7 +73,7 @@ if (CONFIG.discordToken) {
   discordClient.login(CONFIG.discordToken).catch(err => log(`[!] Discord login failed: ${err.message}`));
 }
 
-discordClient.on('ready', () => log(`[+] Discord bot online as ${discordClient.user.tag}. Waiting for .connect command...`));
+discordClient.on('ready', () => log(`[+] Discord bot online as ${discordClient.user.tag}. Waiting for ${CONFIG.prefix}connect command...`));
 
 discordClient.on('messageCreate', async (message) => {
   if (message.author.bot) return;
@@ -73,8 +82,8 @@ discordClient.on('messageCreate', async (message) => {
   const raw = message.content.trim();
   if (!raw) return;
 
-  if (raw.startsWith('.')) {
-    await handleCommand(raw.slice(1).trim(), message);
+  if (raw.startsWith(CONFIG.prefix)) {
+    await handleCommand(raw.slice(CONFIG.prefix.length).trim(), message);
     return;
   }
 
@@ -86,16 +95,18 @@ discordClient.on('messageCreate', async (message) => {
   try { await message.react('💬'); } catch (_) {}
 });
 
-function sendToDiscord(msg) {
+function sendToDiscord(msg, isRaw = false) {
   if (!CONFIG.discordChannel || !discordClient.isReady()) return;
   const channel = discordClient.channels.cache.get(CONFIG.discordChannel);
-  if (channel) channel.send(`\`[Minecraft]\` ${msg}`).catch(() => {});
+  if (channel) {
+    channel.send(isRaw ? msg : `\`[Minecraft]\` ${msg}`).catch(() => {});
+  }
 }
 
 // ===========================================================================
 // MINEFLAYER BOT CREATION & LOGIC
 // ===========================================================================
-function createBot(botName) {
+function createBot(botName, attempt = 0) {
   const bot = mineflayer.createBot({
     host: CONFIG.host, port: CONFIG.port, username: botName,
     auth: 'offline', version: CONFIG.version, respawn: false,
@@ -106,12 +117,18 @@ function createBot(botName) {
   bot._timers = [];
   bot._autoLogin = { loginSent: false, registerSent: false, lastAt: 0 };
   bot._isCleaningUp = false;
+  bot._lastHealth = 20; 
+  bot._lastDamageTime = 0;
+  bot._isPanicEating = false;
 
   bots.push(bot);
-  log(`[~] Connecting ${botName} -> ${CONFIG.host}:${CONFIG.port} (Attempt ${reconnectAttempts + 1}/${MAX_RECONNECTS})`);
+  log(`[~] Connecting ${botName} -> ${CONFIG.host}:${CONFIG.port} (Attempt ${attempt + 1}/${MAX_RECONNECTS})`);
 
   bot.once('spawn', () => {
-    reconnectAttempts = 0; // Reset counter on successful spawn
+    attempt = 0; 
+    bot._lastHealth = 20;
+    bot._lastDamageTime = 0;
+    bot._isPanicEating = false;
     log(`[+] ${bot.username} joined successfully`);
     sendToDiscord(`🟩 **${bot.username}** joined **${CONFIG.host}:${CONFIG.port}**`);
 
@@ -126,10 +143,84 @@ function createBot(botName) {
     setupAutoEat(bot);
   });
 
-  bot.on('messagestr', async (message) => {
-    log(`[CHAT:${bot.username}] ${message}`);
-    sendToDiscord(`**${bot.username}:** ${message}`);
-    await handleAutoLogin(bot, message);
+  bot.on('message', async (jsonMsg) => {
+    const rawStr = jsonMsg.toString();
+    if (!rawStr || !rawStr.trim()) return;
+
+    log(`[CHAT:${bot.username}] ${rawStr}`);
+
+    const ansiStr = jsonMsg.toAnsi();
+    sendToDiscord(`\`\`\`ansi\n${ansiStr}\n\`\`\``, true);
+
+    await handleAutoLogin(bot, rawStr);
+  });
+
+  // Rule 2 & 6: Humanized Health and Damage Monitoring
+  bot.on('health', async () => {
+    // Check threshold to filter healing/regen event spam (Rule 7)
+    if (bot.health < bot._lastHealth - 0.5) {
+      bot._lastDamageTime = Date.now(); 
+
+      // Randomized Damage Reaction (Dodge back)
+      try {
+        bot.setControlState('back', true);
+        const reactionTime = 200 + Math.random() * 500; 
+        setTimeout(() => {
+          try { bot.setControlState('back', false); } catch (_) {}
+        }, reactionTime);
+
+        bot.look(
+          bot.entity.yaw + (Math.random() - 0.5) * 0.3,
+          bot.entity.pitch,
+          true
+        ).catch(() => {});
+      } catch (_) {}
+
+      // Upgrade: Low-Health Panic Eating (Survival Instinct)
+      if (bot.health <= 6 && !bot._isPanicEating && state.autoEatEnabled) {
+        bot._isPanicEating = true;
+        try {
+          const emergencyFood = bot.inventory.items().find(item => 
+            item?.name && EDIBLE_FOODS.slice(0, 3).some(f => item.name.toLowerCase().includes(f)) // prioritize golden foods
+          ) || bot.inventory.items().find(item => 
+            item?.name && EDIBLE_FOODS.some(f => item.name.toLowerCase().includes(f))
+          );
+
+          if (emergencyFood) {
+            sendToDiscord(`🚨 **Emergency Eat:** \`${bot.username}\` is low on health! Panic eating ${emergencyFood.displayName}...`);
+            await bot.equip(emergencyFood, 'hand');
+            await bot.consume();
+          }
+        } catch (_) {} finally {
+          bot._isPanicEating = false;
+        }
+      }
+
+      // Discord Critical Damage Alert
+      if (bot.health < 10) { 
+        sendToDiscord(`⚠️ **ALERT:** \`${bot.username}\` is taking severe damage! Health: ${Math.round(bot.health)}/20 ❤️`);
+      }
+    }
+    bot._lastHealth = bot.health;
+  });
+
+  // Upgrade: Attacker head tracking & Combat Strafing
+  bot.on('entityHurt', (entity) => {
+    if (entity !== bot.entity) return;
+    try {
+      const attacker = bot.nearestEntity(e => (e.type === 'mob' || e.type === 'player') && e.id !== bot.entity.id && bot.entity.position.distanceTo(e.position) < 7);
+      if (attacker) {
+        // Face Attacker Instantly
+        bot.lookAt(attacker.position.offset(0, attacker.height, 0), true).catch(() => {});
+
+        // Random Combat Strafing (Rule 2: Zig-zag movement)
+        const strafeDir = Math.random() > 0.5 ? 'left' : 'right';
+        bot.setControlState(strafeDir, true);
+        setTimeout(() => {
+          try { bot.setControlState(strafeDir, false); } catch (_) {}
+        }, 300 + Math.random() * 300);
+      }
+    } catch (_) {}
   });
 
   bot.on('kicked', reason => {
@@ -152,13 +243,12 @@ function createBot(botName) {
     cleanupBot(bot);
 
     if (!manualDisconnect) {
-      reconnectAttempts++;
-      if (reconnectAttempts >= MAX_RECONNECTS) {
-        log(`[!] Max reconnect attempts reached. Stopping auto-reconnect.`);
-        sendToDiscord(`🚨 **Emergency Stop:** Server is continuously disconnecting the bot. Reached max retries (${MAX_RECONNECTS}/${MAX_RECONNECTS}). Auto-reconnect disabled to prevent ban/storm. Type \`.connect\` to manually try again later.`);
-        manualDisconnect = true; 
+      attempt++;
+      if (attempt >= MAX_RECONNECTS) {
+        log(`[!] Max reconnect attempts reached for ${bot.username}. Stopping auto-reconnect.`);
+        sendToDiscord(`🚨 **Emergency Stop:** \`${bot.username}\` reached max retries (${MAX_RECONNECTS}/${MAX_RECONNECTS}). Auto-reconnect disabled.`);
       } else {
-        setTimeout(() => createBot(botName), CONFIG.joinDelay * 1000);
+        setTimeout(() => createBot(botName, attempt), CONFIG.joinDelay * 1000);
       }
     }
   });
@@ -200,10 +290,8 @@ async function handleAutoLogin(bot, message) {
 function cleanupBot(bot) {
   if (!bot || bot._isCleaningUp) return;
   bot._isCleaningUp = true;
-  
   for (const timer of bot._timers) clearInterval(timer);
   bot._timers.length = 0;
-  
   const index = bots.indexOf(bot);
   if (index !== -1) bots.splice(index, 1);
 }
@@ -215,9 +303,7 @@ function registerInterval(bot, fn, ms) {
 
 function reconnectAll(reasonText) {
   manualDisconnect = true;
-  reconnectAttempts = 0; // Reset counter for manual reconnection
   sendToDiscord(`⏳ Disconnecting... ${reasonText}. Waiting 10 seconds to clear ghost players...`);
-  
   [...bots].forEach(bot => { try { bot.quit(reasonText); } catch (_) {} cleanupBot(bot); });
   bots.length = 0;
 
@@ -225,7 +311,8 @@ function reconnectAll(reasonText) {
     manualDisconnect = false;
     sendToDiscord(`🚀 Reconnecting now...`);
     for (let i = 0; i < CONFIG.threads; i++) {
-      setTimeout(() => createBot(CONFIG.baseUsername), i * CONFIG.joinDelay * 1000);
+      const name = CONFIG.threads > 1 ? `${CONFIG.baseUsername}_${Math.random().toString(36).slice(2, 6)}` : CONFIG.baseUsername;
+      setTimeout(() => createBot(name, 0), i * CONFIG.joinDelay * 1000);
     }
   }, 10000); 
 }
@@ -243,19 +330,8 @@ function startAntiNaNLoop(bot) {
 
 function setupAutoEat(bot) {
   let eating = false;
-  
-  // Safe Edible Foods (Removed spider_eye to avoid poisoning)
-  const EDIBLE_FOODS = [
-    'golden_carrot', 'golden_apple', 'enchanted_golden_apple', 'steak', 
-    'cooked_porkchop', 'cooked_mutton', 'cooked_salmon', 'cooked_beef',
-    'carrot', 'potato', 'baked_potato', 'bread', 'cooked_chicken', 
-    'cooked_cod', 'cooked_rabbit', 'mushroom_stew', 'rabbit_stew', 
-    'beetroot_soup', 'apple', 'melon_slice', 'sweet_berries', 
-    'glow_berries', 'dried_kelp'
-  ];
-
   bot.on('physicsTick', async () => {
-    if (!state.autoEatEnabled || eating || !bot.entity || bot.food >= CONFIG.autoEatThreshold) return;
+    if (!state.autoEatEnabled || eating || !bot.entity || bot.food >= CONFIG.autoEatThreshold || bot._isPanicEating) return;
     
     const food = bot.inventory.items().find(item => 
       item?.name && EDIBLE_FOODS.some(foodName => item.name.toLowerCase().includes(foodName))
@@ -278,11 +354,12 @@ function startAntiAfk(bot) {
 
 function startHumanCamera(bot) {
   registerInterval(bot, () => {
-    if (state.cameraEnabled && bot.entity) {
-      const yaw = bot.entity.yaw + (Math.random() - 0.5) * 0.25;
-      const pitch = Math.max(-0.35, Math.min(0.35, bot.entity.pitch + (Math.random() - 0.5) * 0.08));
-      bot.look(yaw, pitch, true).catch(() => {});
-    }
+    if (!state.cameraEnabled || !bot.entity) return;
+    if (bot._lastDamageTime && (Date.now() - bot._lastDamageTime < 3000)) return; // Fix 4: Suspend if attacked
+
+    const yaw = bot.entity.yaw + (Math.random() - 0.5) * 0.25;
+    const pitch = Math.max(-0.35, Math.min(0.35, bot.entity.pitch + (Math.random() - 0.5) * 0.08));
+    bot.look(yaw, pitch, true).catch(() => {});
   }, 7000);
 }
 
@@ -315,42 +392,46 @@ async function handleCommand(body, discordMsg) {
 
   switch (cmd) {
     case 'connect':
-      const newIp = args[0] || CONFIG.host;
-      const newPort = Number.parseInt(args[1], 10) || CONFIG.port;
+      if (isConnecting) return reply('⏳ Connection process already active. Please wait!');
       
-      CONFIG.host = newIp; 
-      CONFIG.port = newPort;
-      manualDisconnect = false;
-      reconnectAttempts = 0; // Reset counter
+      isConnecting = true;
+      try {
+        const newIp = args[0] || CONFIG.host;
+        const newPort = Number.parseInt(args[1], 10) || CONFIG.port;
+        
+        CONFIG.host = newIp; 
+        CONFIG.port = newPort;
+        manualDisconnect = false;
 
-      if (bots.length > 0) {
-        await reply('⏳ Purane bots ko nikal raha hu. 10 seconds wait karein (Ghost player issue fix)...');
-        [...bots].forEach(b => { try { b.quit(); } catch (_) {} cleanupBot(b); });
-        bots.length = 0;
-        await wait(10000); 
-      }
+        if (bots.length > 0) {
+          await reply('⏳ Cleaning up previous instances. Waiting 10s for ghost-player protection...');
+          [...bots].forEach(b => { try { b.quit(); } catch (_) {} cleanupBot(b); });
+          bots.length = 0;
+          await wait(10000); 
+        }
 
-      await reply(`🚀 Connecting to **${CONFIG.host}:${CONFIG.port}**...`);
-      for (let i = 0; i < CONFIG.threads; i++) {
-        setTimeout(() => createBot(CONFIG.baseUsername), i * CONFIG.joinDelay * 1000);
+        await reply(`🚀 Connecting to **${CONFIG.host}:${CONFIG.port}**...`);
+        for (let i = 0; i < CONFIG.threads; i++) {
+          const name = CONFIG.threads > 1 ? `${CONFIG.baseUsername}_${Math.random().toString(36).slice(2, 6)}` : CONFIG.baseUsername;
+          setTimeout(() => createBot(name, 0), i * CONFIG.joinDelay * 1000);
+        }
+      } finally {
+        isConnecting = false; // Lock guarantee
       }
       break;
 
     case 'quit':
     case 'disconnect':
       if (bots.length === 0) return reply('❌ Bot is already offline.');
-      
       manualDisconnect = true; 
       [...bots].forEach(b => { try { b.quit('Disconnected by Master Remote'); } catch (_) {} cleanupBot(b); });
       bots.length = 0;
-      
-      await reply('🛑 Bot disconnected successfully. Use `.connect` to join again.');
+      await reply(`🛑 Bot disconnected. Use \`${CONFIG.prefix}connect\` to join.`);
       break;
 
     case 'name':
-      if (!args[0]) return reply('❌ Usage: `.name <new_name>`');
+      if (!args[0]) return reply(`❌ Usage: \`${CONFIG.prefix}name <new_name>\``);
       CONFIG.baseUsername = args[0];
-      
       if (bots.length === 0) {
         await reply(`✅ Username updated to **${CONFIG.baseUsername}**.`);
       } else {
@@ -360,9 +441,28 @@ async function handleCommand(body, discordMsg) {
       break;
 
     case 'password':
-      if (!args[0]) return reply('❌ Usage: `.password <password>`');
+      if (!args[0]) return reply(`❌ Usage: \`${CONFIG.prefix}password <password>\``);
       CONFIG.password = args[0];
       await reply('✅ Auto-login password saved!');
+      break;
+
+    case 'mc':
+    case 'chat':
+      const textToSay = args.join(' ');
+      if (!textToSay) return reply(`❌ Usage: \`${CONFIG.prefix}mc <text/command>\``);
+      bots.forEach(b => { if (b && b.entity) b.chat(textToSay); });
+      await discordMsg.react('✅');
+      break;
+
+    case 'experimentalgravity':
+      const toggle = (args[0] || 'on').toLowerCase();
+      if (toggle === 'off') {
+        bots.forEach(b => { if (b.physics) b.physics.gravity = 0; });
+        await reply('🛸 **[Experimental] Anti-Gravity ON:** Fall damage bypassed!');
+      } else {
+        bots.forEach(b => { if (b.physics) b.physics.gravity = 0.08; }); 
+        await reply('🌍 **Gravity ON:** Back to normal physics.');
+      }
       break;
 
     case 'status':
@@ -376,7 +476,7 @@ async function handleCommand(body, discordMsg) {
           { name: 'Food', value: `${Math.round(currentBot.food ?? 0)} / 20 🍖`, inline: true },
           { name: 'Location', value: `X: ${Math.floor(pos.x)} | Y: ${Math.floor(pos.y)} | Z: ${Math.floor(pos.z)} 📍`, inline: false },
           { name: 'Server', value: `${CONFIG.host}:${CONFIG.port}`, inline: true },
-          { name: 'Retries', value: `${reconnectAttempts}/${MAX_RECONNECTS}`, inline: true }
+          { name: 'Threads', value: `${bots.length}/${CONFIG.threads}`, inline: true }
         ).setTimestamp();
       await discordMsg.channel.send({ embeds: [statusEmbed] });
       break;
@@ -406,23 +506,28 @@ async function handleCommand(body, discordMsg) {
           bots.forEach(b => { if (b.pathfinder) b.pathfinder.setGoal(new GoalBlock(x, y, z)); });
           await reply(`🚶 Pathfinding to X: ${x}, Y: ${y}, Z: ${z}`);
         } else {
-          await reply('❌ Usage: `.move forward` | `.move stop` | `.move <x> <y> <z>`');
+          await reply(`❌ Usage: \`${CONFIG.prefix}move forward\` | \`${CONFIG.prefix}move stop\` | \`${CONFIG.prefix}move <x> <y> <z>\``);
         }
       }
       break;
 
     case 'attack':
-      let attacked = false;
-      bots.forEach(b => {
+      bots.forEach(async (b) => {
         if (!b.entity) return;
         const target = b.nearestEntity(e => (e.type === 'mob' || e.type === 'player') && e.id !== b.entity.id);
         if (target) {
-          attacked = true;
-          if (b.entity.position.distanceTo(target.position) <= CONFIG.attackReach) b.attack(target);
-          else if (b.pathfinder) b.pathfinder.setGoal(new GoalFollow(target, 2), true); 
+          if (b.entity.position.distanceTo(target.position) <= CONFIG.attackReach) {
+            // Upgrade: Randomized Attack Delay (Humanized CPS)
+            const baseDelay = 400; 
+            const randomJitter = Math.random() * 250; 
+            await wait(baseDelay + randomJitter);
+            try { b.attack(target); } catch (_) {}
+          } else if (b.pathfinder) {
+            b.pathfinder.setGoal(new GoalFollow(target, 2), true); 
+          }
         }
       });
-      await reply(attacked ? '⚔️ Attacking nearby targets!' : '❌ No nearby targets found.');
+      await reply('⚔️ Commencing humanized attack routines on nearby targets.');
       break;
 
     case 'help':
@@ -430,37 +535,39 @@ async function handleCommand(body, discordMsg) {
         .setColor(0xf1c40f).setTitle('🎮 Master Remote Commands')
         .setDescription([
           '**Server Control:**',
-          '`.connect` (or `.connect <ip>`) - Connect to server',
-          '`.quit` - Disconnect from server',
-          '`.name <new_name>` - Change bot username',
-          '`.password <password>` - Set auto-login password',
+          `\`${CONFIG.prefix}connect <ip>\` - Connect to server`,
+          `\`${CONFIG.prefix}quit\` - Disconnect from server`,
+          `\`${CONFIG.prefix}name <name>\` - Change username`,
+          `\`${CONFIG.prefix}password <pass>\` - Auto-login pass`,
           '',
-          '**Bot Status:**',
-          '`.status` - View Health/Food/Coordinates/Retries',
-          '`.inv` - View Inventory',
+          '**Chat & Info:**',
+          `\`${CONFIG.prefix}mc <text>\` - Send raw command safely`,
+          `\`${CONFIG.prefix}status\` - Health/Food/Loc/Threads`,
+          `\`${CONFIG.prefix}inv\` - View Inventory`,
           '',
-          '**Action:**',
-          '`.move forward` | `.move stop` | `.move <x> <y> <z>`',
-          '`.attack` - Attack nearby entities',
+          '**Action & Hacks:**',
+          `\`${CONFIG.prefix}move forward\` / \`stop\` / \`<x> <y> <z>\``,
+          `\`${CONFIG.prefix}attack\` - Humanized PvP/Mob combat`,
+          `\`${CONFIG.prefix}experimentalgravity off/on\` - [Experimental] Anti-fall damage`,
           '',
-          '*(Messages without "." are forwarded to Minecraft chat)*'
+          '*(Raw messages without prefix are forwarded to Minecraft chat)*'
         ].join('\n'));
       await discordMsg.channel.send({ embeds: [helpEmbed] });
       break;
 
     default:
-      await reply('❌ Unknown command. Use `.help`');
+      await reply(`❌ Unknown command. Use \`${CONFIG.prefix}help\``);
   }
 }
 
 // ===========================================================================
 // STARTUP 
 // ===========================================================================
-log(`[+] Discord Web Server is Online. Waiting for '.connect' command to join Minecraft...`);
+log(`[+] Discord Web Server is Online. Waiting for '${CONFIG.prefix}connect' command to join Minecraft...`);
 
 // ===========================================================================
 // WEB SERVER
 // ===========================================================================
-const app = express();
+const app = reportApp = express();
 app.get('/', (_req, res) => res.send('Discord Master Remote is Online! Waiting for connect command.'));
 app.listen(process.env.PORT || 3000, () => log('[+] Web server started.'));
