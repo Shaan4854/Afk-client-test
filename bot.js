@@ -37,7 +37,6 @@ let manualDisconnect = true;
 let isConnecting = false; 
 const MAX_RECONNECTS = 5;
 
-// Complete Safe Food Database (Rule 2: Spider eye excluded)
 const EDIBLE_FOODS = [
   'golden_carrot', 'golden_apple', 'enchanted_golden_apple', 'steak', 
   'cooked_porkchop', 'cooked_mutton', 'cooked_salmon', 'cooked_beef',
@@ -115,11 +114,15 @@ function createBot(botName, attempt = 0) {
 
   bot.loadPlugin(pathfinder);
   bot._timers = [];
+  bot._cameraTimer = null; 
   bot._autoLogin = { loginSent: false, registerSent: false, lastAt: 0 };
   bot._isCleaningUp = false;
   bot._lastHealth = 20; 
   bot._lastDamageTime = 0;
   bot._isPanicEating = false;
+  bot._attackLoopActive = false; 
+  bot._strafing = false; 
+  bot._attackIdleCycles = 0; 
 
   bots.push(bot);
   log(`[~] Connecting ${botName} -> ${CONFIG.host}:${CONFIG.port} (Attempt ${attempt + 1}/${MAX_RECONNECTS})`);
@@ -129,6 +132,9 @@ function createBot(botName, attempt = 0) {
     bot._lastHealth = 20;
     bot._lastDamageTime = 0;
     bot._isPanicEating = false;
+    bot._attackLoopActive = false;
+    bot._strafing = false;
+    bot._attackIdleCycles = 0;
     log(`[+] ${bot.username} joined successfully`);
     sendToDiscord(`🟩 **${bot.username}** joined **${CONFIG.host}:${CONFIG.port}**`);
 
@@ -137,7 +143,7 @@ function createBot(botName, attempt = 0) {
     bot.pathfinder.setMovements(moves);
 
     startAntiNaNLoop(bot);
-    startHumanCamera(bot);
+    startHumanCamera(bot); 
     startAntiAfk(bot);
     startSonarBypass(bot);
     setupAutoEat(bot);
@@ -155,13 +161,11 @@ function createBot(botName, attempt = 0) {
     await handleAutoLogin(bot, rawStr);
   });
 
-  // Rule 2 & 6: Humanized Health and Damage Monitoring
   bot.on('health', async () => {
-    // Check threshold to filter healing/regen event spam (Rule 7)
     if (bot.health < bot._lastHealth - 0.5) {
-      bot._lastDamageTime = Date.now(); 
+      const damageTime = Date.now(); 
 
-      // Randomized Damage Reaction (Dodge back)
+      // Randomized Damage Reaction
       try {
         bot.setControlState('back', true);
         const reactionTime = 200 + Math.random() * 500; 
@@ -176,12 +180,12 @@ function createBot(botName, attempt = 0) {
         ).catch(() => {});
       } catch (_) {}
 
-      // Upgrade: Low-Health Panic Eating (Survival Instinct)
-      if (bot.health <= 6 && !bot._isPanicEating && state.autoEatEnabled) {
+      // Panic eating isolation epoch verification
+      if (bot.health <= 6 && !bot._isPanicEating && state.autoEatEnabled && (damageTime - bot._lastDamageTime > 1500)) {
         bot._isPanicEating = true;
         try {
           const emergencyFood = bot.inventory.items().find(item => 
-            item?.name && EDIBLE_FOODS.slice(0, 3).some(f => item.name.toLowerCase().includes(f)) // prioritize golden foods
+            item?.name && EDIBLE_FOODS.slice(0, 3).some(f => item.name.toLowerCase().includes(f))
           ) || bot.inventory.items().find(item => 
             item?.name && EDIBLE_FOODS.some(f => item.name.toLowerCase().includes(f))
           );
@@ -196,28 +200,30 @@ function createBot(botName, attempt = 0) {
         }
       }
 
-      // Discord Critical Damage Alert
       if (bot.health < 10) { 
         sendToDiscord(`⚠️ **ALERT:** \`${bot.username}\` is taking severe damage! Health: ${Math.round(bot.health)}/20 ❤️`);
       }
+
+      bot._lastDamageTime = damageTime; 
     }
     bot._lastHealth = bot.health;
   });
 
-  // Upgrade: Attacker head tracking & Combat Strafing
   bot.on('entityHurt', (entity) => {
     if (entity !== bot.entity) return;
+    if (bot._strafing) return; 
+
     try {
       const attacker = bot.nearestEntity(e => (e.type === 'mob' || e.type === 'player') && e.id !== bot.entity.id && bot.entity.position.distanceTo(e.position) < 7);
       if (attacker) {
-        // Face Attacker Instantly
         bot.lookAt(attacker.position.offset(0, attacker.height, 0), true).catch(() => {});
 
-        // Random Combat Strafing (Rule 2: Zig-zag movement)
+        bot._strafing = true;
         const strafeDir = Math.random() > 0.5 ? 'left' : 'right';
         bot.setControlState(strafeDir, true);
         setTimeout(() => {
           try { bot.setControlState(strafeDir, false); } catch (_) {}
+          bot._strafing = false; 
         }, 300 + Math.random() * 300);
       }
     } catch (_) {}
@@ -234,6 +240,7 @@ function createBot(botName, attempt = 0) {
 
   bot.on('death', () => {
     sendToDiscord(`💀 **${bot.username}** died.`);
+    bot._attackLoopActive = false; 
     if (state.autoRespawnEnabled) setTimeout(() => { try { bot.respawn(); } catch (_) {} }, 1500);
   });
 
@@ -292,6 +299,12 @@ function cleanupBot(bot) {
   bot._isCleaningUp = true;
   for (const timer of bot._timers) clearInterval(timer);
   bot._timers.length = 0;
+
+  if (bot._cameraTimer) clearTimeout(bot._cameraTimer); 
+
+  bot._attackLoopActive = false;
+  bot._strafing = false;
+
   const index = bots.indexOf(bot);
   if (index !== -1) bots.splice(index, 1);
 }
@@ -353,14 +366,29 @@ function startAntiAfk(bot) {
 }
 
 function startHumanCamera(bot) {
-  registerInterval(bot, () => {
-    if (!state.cameraEnabled || !bot.entity) return;
-    if (bot._lastDamageTime && (Date.now() - bot._lastDamageTime < 3000)) return; // Fix 4: Suspend if attacked
+  const cameraRoutine = () => {
+    if (manualDisconnect || bots.indexOf(bot) === -1) return;
+    
+    // FIX 3: Stochastic skip simulation (15% chance to replicate human gaze distraction)
+    if (Math.random() < 0.15) {
+      const nextInterval = 5000 + Math.random() * 6000;
+      bot._cameraTimer = setTimeout(cameraRoutine, nextInterval);
+      return;
+    }
 
-    const yaw = bot.entity.yaw + (Math.random() - 0.5) * 0.25;
-    const pitch = Math.max(-0.35, Math.min(0.35, bot.entity.pitch + (Math.random() - 0.5) * 0.08));
-    bot.look(yaw, pitch, true).catch(() => {});
-  }, 7000);
+    if (state.cameraEnabled && bot.entity) {
+      if (!bot._lastDamageTime || (Date.now() - bot._lastDamageTime >= 3000)) {
+        const yaw = bot.entity.yaw + (Math.random() - 0.5) * 0.25;
+        const pitch = Math.max(-0.35, Math.min(0.35, bot.entity.pitch + (Math.random() - 0.5) * 0.08));
+        bot.look(yaw, pitch, true).catch(() => {});
+      }
+    }
+    
+    const nextInterval = 5000 + Math.random() * 6000; 
+    bot._cameraTimer = setTimeout(cameraRoutine, nextInterval);
+  };
+  
+  cameraRoutine();
 }
 
 function startSonarBypass(bot) {
@@ -416,7 +444,7 @@ async function handleCommand(body, discordMsg) {
           setTimeout(() => createBot(name, 0), i * CONFIG.joinDelay * 1000);
         }
       } finally {
-        isConnecting = false; // Lock guarantee
+        isConnecting = false; 
       }
       break;
 
@@ -424,7 +452,11 @@ async function handleCommand(body, discordMsg) {
     case 'disconnect':
       if (bots.length === 0) return reply('❌ Bot is already offline.');
       manualDisconnect = true; 
-      [...bots].forEach(b => { try { b.quit('Disconnected by Master Remote'); } catch (_) {} cleanupBot(b); });
+      [...bots].forEach(b => { 
+        try { b.quit('Disconnected by Master Remote'); } catch (_) {} 
+        if (b.pathfinder) b.pathfinder.setGoal(null); // Clear targets on hard stop
+        cleanupBot(b); 
+      });
       bots.length = 0;
       await reply(`🛑 Bot disconnected. Use \`${CONFIG.prefix}connect\` to join.`);
       break;
@@ -512,22 +544,68 @@ async function handleCommand(body, discordMsg) {
       break;
 
     case 'attack':
+      const subArg = (args[0] || '').toLowerCase();
+      if (subArg === 'stop') {
+        // FIX 2: Safely break attack loop AND instantly drop active pathfinder goals/controls across threads
+        bots.forEach(b => { 
+          b._attackLoopActive = false; 
+          try {
+            if (b.pathfinder) b.pathfinder.setGoal(null);
+            b.clearControlStates();
+          } catch (_) {}
+        });
+        await reply('🛑 Combat execution loop terminated and navigation targets purged.');
+        break;
+      }
+
       bots.forEach(async (b) => {
         if (!b.entity) return;
-        const target = b.nearestEntity(e => (e.type === 'mob' || e.type === 'player') && e.id !== b.entity.id);
-        if (target) {
-          if (b.entity.position.distanceTo(target.position) <= CONFIG.attackReach) {
-            // Upgrade: Randomized Attack Delay (Humanized CPS)
-            const baseDelay = 400; 
-            const randomJitter = Math.random() * 250; 
-            await wait(baseDelay + randomJitter);
-            try { b.attack(target); } catch (_) {}
-          } else if (b.pathfinder) {
-            b.pathfinder.setGoal(new GoalFollow(target, 2), true); 
+        if (b._attackLoopActive) return; 
+        
+        b._attackLoopActive = true;
+        
+        const attackRoutine = async () => {
+          if (manualDisconnect || bots.indexOf(b) === -1 || !b._attackLoopActive) {
+            b._attackLoopActive = false;
+            return; 
           }
-        }
+
+          // FIX 1: Pause attack looping state to let panic eating clear item buffer safely
+          if (b._isPanicEating) {
+            setTimeout(attackRoutine, 1000);
+            return;
+          }
+          
+          const target = b.nearestEntity(e => (e.type === 'mob' || e.type === 'player') && e.id !== b.entity.id);
+          if (target) {
+            b._attackIdleCycles = 0; 
+            const distance = b.entity.position.distanceTo(target.position);
+            
+            if (distance <= CONFIG.attackReach) {
+              const baseDelay = 250; 
+              const randomJitter = Math.random() * 450; 
+              await wait(baseDelay + randomJitter);
+              try { b.attack(target); } catch (_) {}
+              setTimeout(attackRoutine, 50); 
+            } else if (distance < 12 && b.pathfinder) {
+              b.pathfinder.setGoal(new GoalFollow(target, 2), true); 
+              setTimeout(attackRoutine, 500); 
+            } else {
+              setTimeout(attackRoutine, 1000); 
+            }
+          } else {
+            b._attackIdleCycles++;
+            if (b._attackIdleCycles > 300) { 
+              sendToDiscord(`⚔️ No valid attack targets found within the last 5 minutes for **${b.username}**.`);
+              b._attackIdleCycles = 0;
+            }
+            setTimeout(attackRoutine, 1000); 
+          }
+        };
+        
+        await attackRoutine();
       });
-      await reply('⚔️ Commencing humanized attack routines on nearby targets.');
+      await reply('⚔️ Commencing dynamic, loop-managed humanized attack routines.');
       break;
 
     case 'help':
@@ -547,7 +625,8 @@ async function handleCommand(body, discordMsg) {
           '',
           '**Action & Hacks:**',
           `\`${CONFIG.prefix}move forward\` / \`stop\` / \`<x> <y> <z>\``,
-          `\`${CONFIG.prefix}attack\` - Humanized PvP/Mob combat`,
+          `\`${CONFIG.prefix}attack\` - Start continuous combat loop`,
+          `\`${CONFIG.prefix}attack stop\` - Stop continuous combat loop`,
           `\`${CONFIG.prefix}experimentalgravity off/on\` - [Experimental] Anti-fall damage`,
           '',
           '*(Raw messages without prefix are forwarded to Minecraft chat)*'
@@ -566,8 +645,8 @@ async function handleCommand(body, discordMsg) {
 log(`[+] Discord Web Server is Online. Waiting for '${CONFIG.prefix}connect' command to join Minecraft...`);
 
 // ===========================================================================
-// WEB SERVER
+// WEB SERVER 
 // ===========================================================================
-const app = reportApp = express();
+const app = express();
 app.get('/', (_req, res) => res.send('Discord Master Remote is Online! Waiting for connect command.'));
 app.listen(process.env.PORT || 3000, () => log('[+] Web server started.'));
