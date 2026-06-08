@@ -15,7 +15,7 @@ const CONFIG = {
   password: '', // Memory for auto-login
   threads: Number.parseInt(process.env.THREADS, 10) || 1,
   joinDelay: 3,
-  version: 1.21.11, // AUTO-DETECT: Best for Laptop/Java players
+  version: false, // AUTO-DETECT: Best for Laptop/Java players
   clientBrand: 'mcc', // Restored original bypass brand
   autoEatThreshold: 19, // Restored original threshold
   attackReach: 3.5, 
