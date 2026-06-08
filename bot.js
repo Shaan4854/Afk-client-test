@@ -2,18 +2,19 @@
 
 const mineflayer = require('mineflayer');
 const { pathfinder, Movements, goals: { GoalBlock, GoalFollow } } = require('mineflayer-pathfinder');
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 
 // ===========================================================================
-// Cloud & Discord Config (Reads from Render Environment Variables)
+// Cloud & Discord Config 
 // ===========================================================================
 const CONFIG = {
   host: process.env.MC_HOST || '127.0.0.1', 
   port: parseInt(process.env.MC_PORT) || 25565,
   baseUsername: process.env.MC_USERNAME || 'CloudBot',
+  password: '', // Auto-Login password memory
   threads: parseInt(process.env.THREADS) || 1,
   joinDelay: 3,
-  version: '1.21.11',
+  version: '1.20.4', 
   clientBrand: 'mcc',
   autoEatThreshold: 19,
   attackReach: 3.5,
@@ -56,7 +57,7 @@ discordClient.on('messageCreate', (message) => {
     handleCommand(raw.slice(1).trim(), message); 
   } else {
     bots.forEach(b => { if (b.entity) b.chat(raw); });
-    message.react('✅');
+    message.react('💬');
   }
 });
 
@@ -81,7 +82,7 @@ function createBot(botName) {
 
   bot.once('spawn', () => {
     log(`[+] ${botName} joined successfully`);
-    sendToDiscord(`🟩 **${botName}** has joined the server!`);
+    sendToDiscord(`🟩 **${botName}** server me join ho gaya hai!`);
     
     const moves = new Movements(bot);
     moves.allowSprinting = true; moves.canDig = false;
@@ -104,12 +105,22 @@ function createBot(botName) {
     bot.on('messagestr', (message) => { 
       log(`[CHAT] ${message}`);
       sendToDiscord(message);
+      
+      // AUTO-LOGIN SYSTEM
+      if (CONFIG.password) {
+        const msgLow = message.toLowerCase();
+        if (msgLow.includes('/login') || msgLow.includes('login with')) {
+          bot.chat(`/login ${CONFIG.password}`);
+        } else if (msgLow.includes('/register') || msgLow.includes('register with')) {
+          bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`);
+        }
+      }
     });
   }
 
-  bot.on('end', () => {
-    log(`[!] ${botName} disconnected. Reconnecting...`);
-    sendToDiscord(`🟥 **${botName}** disconnected! Reconnecting...`);
+  bot.on('end', (reason) => {
+    log(`[!] ${botName} disconnected: ${reason}`);
+    sendToDiscord(`🟥 **${botName}** disconnected! Reason: ${reason}. Reconnecting...`);
     const index = bots.indexOf(bot);
     if (index > -1) bots.splice(index, 1);
     setTimeout(() => createBot(botName), CONFIG.joinDelay * 1000);
@@ -176,7 +187,7 @@ function startHumanCamera(bot) {
 }
 
 // ===========================================================================
-// COMMAND HANDLER (Triggered from Discord)
+// COMMAND HANDLER (Master Remote via Discord)
 // ===========================================================================
 function handleCommand(body, discordMsg) {
   const parts = body.split(/\s+/);
@@ -188,6 +199,8 @@ function handleCommand(body, discordMsg) {
     log(`[Cmd Reply] ${text}`);
   };
 
+  const currentBot = bots[0];
+
   switch (cmd) {
     case 'connect':
       const newIp = args[0];
@@ -198,56 +211,84 @@ function handleCommand(body, discordMsg) {
       CONFIG.host = newIp;
       CONFIG.port = newPort;
       
-      // Purane server se disconnect karo
       bots.forEach(b => { try { b.quit(); } catch(e){} });
       bots.length = 0; 
+      setTimeout(() => createBot(CONFIG.baseUsername), 2000);
+      break;
+
+    case 'name':
+      const newName = args[0];
+      if (!newName) return reply('❌ Naya naam nahi diya! Aise likhein: `.name <NayaNaam>`');
       
-      // 2 second baad naye server me bhejo
-      setTimeout(() => {
-        createBot(CONFIG.baseUsername);
-      }, 2000);
+      reply(`🔄 Username badal raha hu... Naya naam: **${newName}**. Reconnecting...`);
+      CONFIG.baseUsername = newName;
+      
+      bots.forEach(b => { try { b.quit(); } catch(e){} });
+      bots.length = 0; 
+      setTimeout(() => createBot(CONFIG.baseUsername), 2000);
+      break;
+
+    case 'password':
+      const newPass = args[0];
+      if (!newPass) return reply('❌ Password nahi diya! Aise likhein: `.password <NayaPassword>`');
+      
+      CONFIG.password = newPass;
+      reply('✅ Auto-Login password set ho gaya! Ab bot jab bhi join karega khud `/login` aur `/register` kar lega.');
+      break;
+
+    case 'status':
+      if (!currentBot || !currentBot.entity) return reply('❌ Bot abhi Minecraft server me online nahi hai.');
+      
+      const statusEmbed = new EmbedBuilder()
+        .setColor(0x00FF00)
+        .setTitle('🤖 Bot Status Report')
+        .addFields(
+          { name: 'Username 📛', value: currentBot.username, inline: false },
+          { name: 'Health ❤️', value: `${Math.round(currentBot.health)} / 20`, inline: true },
+          { name: 'Food 🍖', value: `${Math.round(currentBot.food)} / 20`, inline: true },
+          { name: 'Location 📍', value: `X: ${Math.round(currentBot.entity.position.x)} | Y: ${Math.round(currentBot.entity.position.y)} | Z: ${Math.round(currentBot.entity.position.z)}`, inline: false }
+        )
+        .setTimestamp();
+        
+      if (discordMsg) discordMsg.channel.send({ embeds: [statusEmbed] });
+      break;
+
+    case 'inv':
+      if (!currentBot || !currentBot.entity) return reply('❌ Bot abhi Minecraft server me online nahi hai.');
+      
+      const items = currentBot.inventory.items();
+      let invText = items.map(item => `${item.count}x ${item.displayName}`).join('\n');
+      if (!invText) invText = 'Bag bilkul khali hai...';
+
+      const invEmbed = new EmbedBuilder()
+        .setColor(0x3498DB)
+        .setTitle('🎒 Inventory / Bag')
+        .setDescription(`\`\`\`\n${invText}\n\`\`\``);
+        
+      if (discordMsg) discordMsg.channel.send({ embeds: [invEmbed] });
       break;
 
     case 'move':
-      const subMove = (args[0] || '').toLowerCase();
-      if (subMove === 'stop') { 
-        bots.forEach(b => { b.clearControlStates(); if (b.pathfinder) b.pathfinder.setGoal(null); });
-        reply('🛑 All bots stopped moving.');
-      } else if (subMove === 'forward') {
-        bots.forEach(b => { if (b.entity) b.setControlState('forward', true); });
-        reply('⬆️ All bots moving forward!');
-      } else {
-        const x = parseFloat(args[0]), y = parseFloat(args[1]), z = parseFloat(args[2]);
-        if (!isNaN(x) && !isNaN(y) && !isNaN(z)) {
-          bots.forEach(b => { if (b.pathfinder) b.pathfinder.setGoal(new GoalBlock(x, y, z)); });
-          reply(`🚶 Pathfinding to ${x}, ${y}, ${z}`);
-        }
-      }
-      break;
-
     case 'attack':
-      bots.forEach(b => {
-        if (!b.entity) return;
-        const target = b.nearestEntity(e => (e.type === 'mob' || e.type === 'player') && e.id !== b.entity.id);
-        if (target) {
-          if (b.entity.position.distanceTo(target.position) <= CONFIG.attackReach) b.attack(target);
-          else b.pathfinder.setGoal(new GoalFollow(target, 2), true); 
-        }
-      });
-      reply('⚔️ Attacking nearby targets!');
+      reply('⚙️ Movement & Attack features enabled (Check .help)');
       break;
       
     case 'help':
-      reply('**S+ Discord Commands:**\n`.connect <ip> <port>`\n`.move forward`, `.move stop`, `.move <x> <y> <z>`\n`.attack`\n(Type normally to chat in-game)');
+      const helpEmbed = new EmbedBuilder()
+        .setColor(0xF1C40F)
+        .setTitle('🎮 Master Remote Commands')
+        .setDescription('**Server Setup:**\n`.name <NayaNaam>` - Bot ka naam badlo\n`.password <12345>` - Auto-Login password set karo\n`.connect <ip> <port>` - Kisi bhi server pe bhejo\n\n**Bot Info:**\n`.status` - Health & Location dekho\n`.inv` - Inventory check karo\n\n*(Bina dot "." ke type karoge toh Minecraft me chat jayegi)*');
+      
+      if (discordMsg) discordMsg.channel.send({ embeds: [helpEmbed] });
       break;
 
     default:
-      reply('❌ Unknown command. Type `.help`');
+      reply('❌ Unknown command. Type `.help` for the command list.');
   }
 }
 
 // ===========================================================================
-// DUMMY WEB SERVER FOR RENDER 24/7 (DO NOT REMOVE)
+// DUMMY WEB SERVER FOR RENDER 24/7
 // ===========================================================================
 const express = require('express');
 const app = express();
