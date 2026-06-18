@@ -1,797 +1,953 @@
 'use strict';
 
-const mineflayer = require('mineflayer');
-const { pathfinder, Movements, goals: { GoalBlock, GoalFollow } } = require('mineflayer-pathfinder');
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
-const express = require('express');
+const mineflayer  = require('mineflayer');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
+const readline    = require('readline');
+const fs          = require('fs');
+const path        = require('path');
 
-// ===========================================================================
-// CONFIGURATION (Rule 5: Let used for safe mutability)
-// ===========================================================================
-let CONFIG = {
-  host: process.env.MC_HOST || '127.0.0.1',
-  port: Number.parseInt(process.env.MC_PORT, 10) || 25565,
-  baseUsername: process.env.MC_USERNAME || 'CloudBot',
-  password: '', 
-  threads: Number.parseInt(process.env.THREADS, 10) || 1,
-  joinDelay: 3,
-  version: false, // AUTO-DETECT
-  clientBrand: 'mcc', 
-  autoEatThreshold: 19, 
-  attackReach: 3.5, 
-  prefix: '.', 
-  guiToken: process.env.GUI_TOKEN || '', 
-  discordToken: process.env.DISCORD_TOKEN || '',
-  discordChannel: process.env.DISCORD_CHANNEL || ''
-};
+// ─── Config ───────────────────────────────────────────────────────────────────
+const CONFIG_FILE = path.join(__dirname, 'bot-config.json');
+
+function loadSavedConfig() {
+  try {
+    if (fs.existsSync(CONFIG_FILE)) return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch {}
+  return null;
+}
+function saveConfig(cfg) {
+  try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2)); } catch {}
+}
+
+// ─── GUI Server (optional — needs: npm install express socket.io) ─────────────
+let io              = null;
+let currentHandleCommand = null;
+let guiClients      = 0;
+
+function tryStartGUI() {
+  try {
+    const http       = require('http');
+    const express    = require('express');
+    const { Server } = require('socket.io');
+    const app        = express();
+    const srv        = http.createServer(app);
+    io               = new Server(srv);
+
+    app.get('/', (_req, res) => res.send(GUI_HTML));
+
+    io.on('connection', socket => {
+      guiClients++;
+      socket.emit('status',  { connected: !!currentBot, ...CONFIG });
+      socket.emit('toggles', safeToggles());
+      if (currentBot) { socket.emit('stats', liveStats()); }
+      socket.on('command', cmd => {
+        if (typeof cmd === 'string' && currentHandleCommand) {
+          rawLog(`[GUI] Command: ${cmd}`);
+          currentHandleCommand(cmd.trim());
+        }
+      });
+      socket.on('disconnect', () => guiClients--);
+    });
+
+    srv.listen(CONFIG.guiPort || 3000, () => {
+      rawLog(`[GUI] Dashboard → http://localhost:${CONFIG.guiPort || 3000}`);
+    });
+  } catch {
+    rawLog('[GUI] Web dashboard not available. Run: npm install express socket.io');
+  }
+}
+
+function emit(event, data) { if (io) io.emit(event, data); }
+
+function safeToggles() {
+  return {
+    autoEatEnabled:     state.autoEatEnabled,
+    antiAfkEnabled:     state.antiAfkEnabled,
+    autoRespawnEnabled: state.autoRespawnEnabled,
+    cameraEnabled:      state.cameraEnabled,
+    attackActive:       state.attackActive,
+    loggedIn:           state.loggedIn,
+  };
+}
+
+function prompt(rl, question) {
+  return new Promise(resolve => rl.question(question, a => resolve(a.trim())));
+}
+
+async function getConfig() {
+  const saved = loadSavedConfig();
+  const rl    = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  console.log('\n================================');
+  console.log('       MINEFLAYER BOT SETUP     ');
+  console.log('================================');
+
+  if (saved) {
+    console.log('  Saved config found:');
+    console.log(`    Host     : ${saved.host}:${saved.port}`);
+    console.log(`    Username : ${saved.username}`);
+    console.log(`    Password : ${saved.password ? '(set)' : '(none)'}`);
+    console.log(`    Version  : ${saved.version}`);
+    console.log(`    Auth     : ${saved.auth}`);
+    const use = await prompt(rl, 'Use saved config? [Y/n]: ');
+    if (!use || use.toLowerCase() === 'y') { rl.close(); console.log('================================\n'); return saved; }
+  }
+
+  let host = await prompt(rl, `Server IP   [${saved?.host || 'localhost'}]: `);
+  if (!host) host = saved?.host || 'localhost';
+
+  let portRaw = await prompt(rl, `Server Port [${saved?.port || 25565}]: `);
+  const port  = parseInt(portRaw) || saved?.port || 25565;
+
+  let username = await prompt(rl, `Username    [${saved?.username || ''}]: `);
+  if (!username) username = saved?.username || 'Bot_' + Math.floor(Math.random() * 9999);
+
+  let password = await prompt(rl, `Password    [for /login — blank to skip]: `);
+  if (!password) password = saved?.password || '';
+
+  let versionRaw = await prompt(rl, `MC Version  [${saved?.version || '1.20.1'}]: `);
+  const version  = versionRaw || saved?.version || '1.20.1';
+
+  console.log('  Auth mode: (1) offline  (2) microsoft');
+  let authRaw = await prompt(rl, `Auth mode   [${saved?.auth === 'microsoft' ? '2' : '1'}]: `);
+  if (!authRaw) authRaw = saved?.auth === 'microsoft' ? '2' : '1';
+  const auth = authRaw === '2' ? 'microsoft' : 'offline';
+
+  let guiPortRaw = await prompt(rl, `GUI port    [${saved?.guiPort || 3000}]: `);
+  const guiPort  = parseInt(guiPortRaw) || saved?.guiPort || 3000;
+
+  rl.close();
+
+  const cfg = { host, port, username, password, version, auth, guiPort };
+
+  const rl2  = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const save = await prompt(rl2, 'Save config? [Y/n]: ');
+  rl2.close();
+  if (!save || save.toLowerCase() === 'y') {
+    saveConfig(cfg);
+    rawLog('[Config] Saved to bot-config.json');
+  }
+
+  console.log('================================\n');
+  return cfg;
+}
 
 const state = {
-  cameraEnabled: true,
-  autoEatEnabled: true,
+  autoEatEnabled:     true,
+  antiAfkEnabled:     true,
   autoRespawnEnabled: true,
-  antiAfkEnabled: false,
-  bypassEnabled: true,
-  afkHeadLock: true // Global default setup parameter
+  cameraEnabled:      true,
+  antiAfkTimeout:     null,
+  cameraTimeout:      null,
+  verifying:          false,
+  loggedIn:           false,
+  loginSent:          false,
+  eating:             false,
+  attackActive:       false,
 };
 
-const bots = [];
-let manualDisconnect = true; 
-let isConnecting = false; 
-const MAX_RECONNECTS = 5;
+let CONFIG            = {};
+let currentBot        = null;
+let reconnectAttempts = 0;
+let statsInterval     = null;
 
-const EDIBLE_FOODS = [
-  'golden_carrot', 'golden_apple', 'enchanted_golden_apple', 'steak', 
-  'cooked_porkchop', 'cooked_mutton', 'cooked_salmon', 'cooked_beef',
-  'carrot', 'potato', 'baked_potato', 'bread', 'cooked_chicken', 
-  'cooked_cod', 'cooked_rabbit', 'mushroom_stew', 'rabbit_stew', 
-  'beetroot_soup', 'apple', 'melon_slice', 'sweet_berries', 
-  'glow_berries', 'dried_kelp'
-];
+function rawLog(msg) { process.stdout.write(msg + '\n'); }
 
-function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
-
-function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-
-function safeReason(reason) {
-  if (!reason) return 'unknown';
-  if (typeof reason === 'string') return reason;
-  if (reason instanceof Error) return `${reason.name}: ${reason.message}`;
-  try { return JSON.stringify(reason); } catch { return String(reason); }
-}
-
-function getPrimaryBot() {
-  return bots.find(b => b && b.entity) || bots[0] || null;
-}
-
-// ===========================================================================
-// DISCORD BOT SETUP
-// ===========================================================================
-const discordClient = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
-});
-
-if (CONFIG.discordToken) {
-  discordClient.login(CONFIG.discordToken).catch(err => log(`[!] Discord login failed: ${err.message}`));
-}
-
-discordClient.on('ready', () => log(`[+] Discord bot online as ${discordClient.user.tag}. Waiting for ${CONFIG.prefix}connect...`));
-
-discordClient.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
-  if (!CONFIG.discordChannel || message.channel.id !== CONFIG.discordChannel) return;
-
-  const raw = message.content.trim();
-  if (!raw) return;
-
-  if (raw.startsWith(CONFIG.prefix)) {
-    await handleCommand(raw.slice(CONFIG.prefix.length).trim(), message);
-    return;
+function log(msg, type) {
+  rawLog(msg);
+  if (!type) {
+    if      (msg.startsWith('[Chat]'))    type = 'chat';
+    else if (msg.startsWith('[!]'))       type = 'error';
+    else if (msg.startsWith('[Sonar]'))   type = 'sonar';
+    else if (msg.startsWith('[Auth]'))    type = 'auth';
+    else if (msg.startsWith('[Move]'))    type = 'move';
+    else if (msg.startsWith('[Attack]'))  type = 'attack';
+    else if (msg.startsWith('[MC]'))      type = 'mc';
+    else if (msg.startsWith('[GUI]'))     type = 'gui';
+    else                                  type = 'system';
   }
+  emit('log', { msg, type, time: new Date().toLocaleTimeString() });
+}
 
-  bots.forEach(bot => {
-    if (bot && bot.entity) {
-      try { bot.chat(raw); } catch (err) { log(`[!] Chat relay failed: ${err.message}`); }
+const FOOD_PRIORITY = {
+  golden_carrot: 10, cooked_porkchop: 9, cooked_beef: 9, cooked_mutton: 9,
+  cooked_salmon: 8,  cooked_chicken: 8,  cooked_cod: 7,  cooked_rabbit: 7,
+  bread: 6,          baked_potato: 6,    mushroom_stew: 7, rabbit_stew: 8,
+  pumpkin_pie: 7,    apple: 5,           sweet_berries: 3, carrot: 3,
+  melon_slice: 2,    cookie: 2,          dried_kelp: 1,   chorus_fruit: 1,
+};
+
+function bestFood(inventory) {
+  return inventory.items()
+    .filter(i => FOOD_PRIORITY[i.name] !== undefined)
+    .sort((a, b) => (FOOD_PRIORITY[b.name] || 0) - (FOOD_PRIORITY[a.name] || 0))[0] || null;
+}
+
+function liveStats() {
+  const bot = currentBot;
+  if (!bot || !bot.entity) return null;
+  const pos = bot.entity.position;
+  return {
+    health:  Math.round((bot.health  || 0) * 10) / 10,
+    food:    Math.round((bot.food    || 0) * 10) / 10,
+    xpLevel: bot.experience?.level || 0,
+    x: pos.x.toFixed(1), y: pos.y.toFixed(1), z: pos.z.toFixed(1),
+    loggedIn: state.loggedIn,
+  };
+}
+
+function reconnectDelay() {
+  const base = 7000, cap = 120000;
+  return Math.min(base * Math.pow(2, reconnectAttempts - 1), cap) + Math.floor(Math.random() * 3000);
+}
+
+function humanDelay(min, max) { return Math.floor(Math.random() * (max - min)) + min; }
+
+function extractText(obj) {
+  if (typeof obj === 'string') return obj;
+  if (obj?.value !== undefined) return extractText(obj.value);
+  if (Array.isArray(obj)) return obj.map(extractText).join('');
+  if (typeof obj === 'object') {
+    const parts = [];
+    if (obj.text)  parts.push(extractText(obj.text));
+    if (obj.extra) parts.push(extractText(obj.extra));
+    return parts.join('');
+  }
+  return '';
+}
+
+function createBot() {
+  log(`[*] Connecting to ${CONFIG.host}:${CONFIG.port} as '${CONFIG.username}' (${CONFIG.auth})...`);
+  emit('status', { connected: false, reconnecting: true, attempt: reconnectAttempts, ...CONFIG });
+
+  const bot = mineflayer.createBot({
+    host:     CONFIG.host,
+    port:     CONFIG.port,
+    username: CONFIG.username,
+    version:  CONFIG.version,
+    auth:     CONFIG.auth,
+    checkTimeoutInterval: 30000,
+    physicsEnabled: true,
+    hideErrors:     false,
+  });
+
+  currentBot = bot;
+  state.loggedIn = false;
+  bot.loadPlugin(pathfinder);
+
+  bot.on('forcedMove', () => {
+    state.verifying = true;
+    log('[Sonar] Teleported — letting physics settle...');
+    bot.pathfinder.stop();
+    ['forward','back','left','right','jump','sprint','sneak'].forEach(k => bot.setControlState(k, false));
+    setTimeout(() => { state.verifying = false; log('[Sonar] Verification window passed — resuming.'); }, humanDelay(2500, 4500));
+  });
+
+  bot.on('message', (jsonMsg) => {
+    const raw  = jsonMsg.toString();
+    const motd = typeof jsonMsg.toMotd === 'function' ? jsonMsg.toMotd() : raw;
+    const text = raw.toLowerCase();
+    rawLog(`[Chat] ${raw}`);
+    emit('log', { msg: raw, motd, type: 'chat', time: new Date().toLocaleTimeString() });
+
+    if (!raw.includes('<') && !raw.includes('>')) {
+      if (CONFIG.password && !state.loggedIn && !state.loginSent &&
+          text.includes('/login') && (text.includes('log in') || text.includes('login') || text.includes('please'))) {
+        state.loginSent = true;
+        setTimeout(() => { bot.chat(`/login ${CONFIG.password}`); log('[Auth] Sent: /login ***'); }, humanDelay(600, 1200));
+        return;
+      }
+      if (CONFIG.password && !state.loggedIn && !state.loginSent &&
+          text.includes('/register') && (text.includes('register') || text.includes('please'))) {
+        state.loginSent = true;
+        setTimeout(() => { bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`); log('[Auth] Sent: /register ***'); }, humanDelay(600, 1200));
+        return;
+      }
+      if (!state.loggedIn && (text.includes('logged in') || text.includes('welcome back') ||
+          text.includes('successfully') || text.includes('authenticated'))) {
+        state.loggedIn = true;
+        log('[Auth] Logged in successfully.');
+        emit('toggles', safeToggles());
+        return;
+      }
+      const verifyMatch = raw.match(/\/verify\s+([A-Za-z0-9_-]{3,32})/);
+      if (verifyMatch) {
+        setTimeout(() => { bot.chat(`/verify ${verifyMatch[1]}`); log(`[Sonar] Sent: /verify ${verifyMatch[1]}`); }, humanDelay(800, 1400));
+        return;
+      }
+      if (text.includes('/verify') && (text.includes('type') || text.includes('enter') || text.includes('run'))) {
+        setTimeout(() => { bot.chat('/verify'); log('[Sonar] Sent: /verify'); }, humanDelay(900, 1600));
+      }
     }
   });
-  try { await message.react('💬'); } catch (_) {}
-});
-
-function sendToDiscord(msg, isRaw = false) {
-  if (!CONFIG.discordChannel || !discordClient.isReady()) return;
-  const channel = discordClient.channels.cache.get(CONFIG.discordChannel);
-  if (channel) {
-    channel.send(isRaw ? msg : `\`[Minecraft]\` ${msg}`).catch(() => {});
-  }
-}
-
-// ===========================================================================
-// MINEFLAYER BOT CREATION & LOGIC
-// ===========================================================================
-function createBot(botName, attempt = 0) {
-  const bot = mineflayer.createBot({
-    host: CONFIG.host, port: CONFIG.port, username: botName,
-    auth: 'offline', version: CONFIG.version, respawn: false,
-    hideErrors: false, brand: CONFIG.clientBrand
-  });
-
-  bot.loadPlugin(pathfinder);
-  bot._timers = [];
-  bot._cameraTimer = null; 
-  bot._autoLogin = { loginSent: false, registerSent: false, lastAt: 0 };
-  bot._isCleaningUp = false;
-  bot._lastHealth = 20; 
-  bot._lastDamageTime = 0;
-  bot._isPanicEating = false;
-  bot._attackLoopActive = false; 
-  bot._strafing = false; 
-  bot._attackIdleCycles = 0; 
-  bot._afkHeadLock = state.afkHeadLock; // 🔧 FIX: Settings encapsulation on instance birth
-
-  bots.push(bot);
-  log(`[~] Connecting ${botName} -> ${CONFIG.host}:${CONFIG.port} (Attempt ${attempt + 1}/${MAX_RECONNECTS})`);
 
   bot.once('spawn', () => {
-    attempt = 0; 
-    bot._lastHealth = 20;
-    bot._lastDamageTime = 0;
-    bot._isPanicEating = false;
-    bot._attackLoopActive = false;
-    bot._strafing = false;
-    bot._attackIdleCycles = 0;
-    bot._afkHeadLock = state.afkHeadLock;
-    log(`[+] ${bot.username} joined successfully`);
-    sendToDiscord(`🟩 **${bot.username}** joined **${CONFIG.host}:${CONFIG.port}**`);
-
-    const moves = new Movements(bot);
-    moves.allowSprinting = true; moves.canDig = false;
-    bot.pathfinder.setMovements(moves);
-
-    startAntiNaNLoop(bot);
-    startHumanCamera(bot); 
-    startAntiAfk(bot);
-    startSonarBypass(bot);
-    setupAutoEat(bot);
+    reconnectAttempts = 0;
+    state.loginSent = false;
+    state.eating    = false;
+    log(`[*] Spawned as ${bot.username}`);
+    bot.pathfinder.setMovements(new Movements(bot));
+    emit('status', { connected: true, reconnecting: false, username: bot.username, ...CONFIG });
+    if (!CONFIG.password) state.loggedIn = true;
+    setTimeout(() => { if (!state.verifying) { startAntiAfk(); startCamera(); } }, humanDelay(1500, 3000));
+    clearInterval(statsInterval);
+    statsInterval = setInterval(() => { const s = liveStats(); if (s) emit('stats', s); }, 2000);
   });
 
-  bot.on('message', async (jsonMsg) => {
-    const rawStr = jsonMsg.toString();
-    if (!rawStr || !rawStr.trim()) return;
-
-    log(`[CHAT:${bot.username}] ${rawStr}`);
-
-    const ansiStr = jsonMsg.toAnsi();
-    sendToDiscord(`\`\`\`ansi\n${ansiStr}\n\`\`\``, true);
-
-    await handleAutoLogin(bot, rawStr);
-  });
-
-  bot.on('health', async () => {
-    if (bot.health < bot._lastHealth - 0.5) {
-      const damageTime = Date.now(); 
-
-      // Pushback dynamics execute unmodified on the active thread
-      try {
-        bot.setControlState('back', true);
-        const reactionTime = 200 + Math.random() * 500; 
-        setTimeout(() => {
-          try { bot.setControlState('back', false); } catch (_) {}
-        }, reactionTime);
-        
-        // 🔧 FIX: Check encapsulated instance lock token
-        if (!bot._afkHeadLock) {
-          bot.look(
-            bot.entity.yaw + (Math.random() - 0.5) * 0.3,
-            bot.entity.pitch,
-            true
-          ).catch(() => {});
-        }
-      } catch (_) {}
-
-      if (bot.health <= 6 && !bot._isPanicEating && state.autoEatEnabled && (damageTime - bot._lastDamageTime > 1500)) {
-        bot._isPanicEating = true;
-        try {
-          const emergencyFood = bot.inventory.items().find(item => 
-            item?.name && EDIBLE_FOODS.slice(0, 3).some(f => item.name.toLowerCase().includes(f))
-          ) || bot.inventory.items().find(item => 
-            item?.name && EDIBLE_FOODS.some(f => item.name.toLowerCase().includes(f))
-          );
-
-          if (emergencyFood) {
-            sendToDiscord(`🚨 **Emergency Eat:** \`${bot.username}\` is low on health! Panic eating ${emergencyFood.displayName}...`);
-            await bot.equip(emergencyFood, 'hand');
-            await bot.consume();
-          }
-        } catch (_) {} finally {
-          bot._isPanicEating = false;
-        }
+  bot.on('health', () => {
+    if (!state.autoEatEnabled || state.verifying || bot.usingHeldItem || state.eating) return;
+    if (bot.food < 18) {
+      const food = bestFood(bot.inventory);
+      if (food) {
+        state.eating = true;
+        bot.equip(food, 'hand').then(() => bot.consume()).catch(() => {}).finally(() => { state.eating = false; });
       }
-
-      if (bot.health < 10) { 
-        sendToDiscord(`⚠️ **ALERT:** \`${bot.username}\` is taking severe damage! Health: ${Math.round(bot.health)}/20 ❤️`);
-      }
-
-      bot._lastDamageTime = damageTime; 
     }
-    bot._lastHealth = bot.health;
-  });
-
-  bot.on('entityHurt', (entity) => {
-    if (entity !== bot.entity) return;
-    if (bot._strafing) return; 
-
-    try {
-      const attacker = bot.nearestEntity(e => (e.type === 'mob' || e.type === 'player') && e.id !== bot.entity.id && bot.entity.position.distanceTo(e.position) < 7);
-      if (attacker) {
-        // 🔧 FIX: Conditional look tracking derived from isolated vector parameters
-        if (!bot._afkHeadLock) {
-          bot.lookAt(attacker.position.offset(0, attacker.height, 0), true).catch(() => {});
-        }
-
-        bot._strafing = true;
-        const strafeDir = Math.random() > 0.5 ? 'left' : 'right';
-        bot.setControlState(strafeDir, true);
-        setTimeout(() => {
-          try { bot.setControlState(strafeDir, false); } catch (_) {}
-          bot._strafing = false; 
-        }, 300 + Math.random() * 300);
-      }
-    } catch (_) {}
-  });
-
-  bot.on('kicked', reason => {
-    log(`[!] ${bot.username} kicked: ${safeReason(reason)}`);
-    sendToDiscord(`🟥 **${bot.username}** kicked: ${safeReason(reason)}`);
-  });
-
-  bot.on('error', err => {
-    log(`[!] ${bot.username} error: ${safeReason(err)}`);
   });
 
   bot.on('death', () => {
-    sendToDiscord(`💀 **${bot.username}** died.`);
-    bot._attackLoopActive = false; 
-    if (state.autoRespawnEnabled) setTimeout(() => { try { bot.respawn(); } catch (_) {} }, 1500);
+    log('[!] Bot died.');
+    if (state.autoRespawnEnabled) setTimeout(() => { bot.respawn(); log('[*] Auto-respawned.'); }, humanDelay(800, 2500));
   });
 
-  bot.on('end', reason => {
-    log(`[!] ${bot.username} disconnected: ${safeReason(reason)}`);
-    sendToDiscord(`🟥 **${bot.username}** disconnected: ${safeReason(reason)}`);
-    cleanupBot(bot);
+  bot.on('kicked', (reason) => {
+    let readable = reason;
+    try { readable = extractText(JSON.parse(reason)); } catch {}
+    log(`[!] Kicked: ${readable}`);
+    if (readable.toLowerCase().includes('bot verification')) log('[Sonar] ⚠  Failed: gravity/main check');
+    else if (readable.toLowerCase().includes('too many'))    log('[Sonar] ⚠  Failed: reconnect rate-limit — backing off');
+    else if (readable.toLowerCase().includes('captcha'))     log('[Sonar] ⚠  Failed: CAPTCHA (map-image)');
+  });
 
-    if (!manualDisconnect) {
-      attempt++;
-      if (attempt >= MAX_RECONNECTS) {
-        log(`[!] Max reconnect attempts reached for ${bot.username}. Stopping auto-reconnect.`);
-        sendToDiscord(`🚨 **Emergency Stop:** \`${bot.username}\` reached max retries (${MAX_RECONNECTS}/${MAX_RECONNECTS}). Auto-reconnect disabled.`);
-      } else {
-        setTimeout(() => createBot(botName, attempt), CONFIG.joinDelay * 1000);
-      }
+  bot.on('end', (reason) => {
+    stopAntiAfk(); stopCamera();
+    clearInterval(statsInterval);
+    bot.removeAllListeners();
+    currentBot = null; state.loggedIn = false; state.loginSent = false;
+    state.eating = false; state.attackActive = false;
+    reconnectAttempts++;
+    const delay = reconnectDelay();
+    log(`[!] Disconnected: ${reason} (attempt #${reconnectAttempts}) — reconnecting in ${(delay / 1000).toFixed(1)} s...`);
+    emit('status', { connected: false, reconnecting: true, attempt: reconnectAttempts, nextRetry: (delay / 1000).toFixed(1), ...CONFIG });
+    setTimeout(createBot, delay);
+  });
+
+  bot.on('error', (err) => log(`[!] Error: ${err.message}`));
+
+  function scheduleAntiAfk() {
+    if (!state.antiAfkEnabled) return;
+    state.antiAfkTimeout = setTimeout(() => {
+      if (!state.verifying) doAntiAfkAction();
+      scheduleAntiAfk();
+    }, humanDelay(25000, 45000));
+  }
+
+  function doAntiAfkAction() {
+    const roll = Math.random();
+    if      (roll < 0.40) { bot.setControlState('jump',    true); setTimeout(() => bot.setControlState('jump',    false), humanDelay(150, 250)); }
+    else if (roll < 0.65) { bot.setControlState('sneak',   true); setTimeout(() => bot.setControlState('sneak',   false), humanDelay(300, 700)); }
+    else if (roll < 0.82) { bot.setControlState('forward', true); setTimeout(() => bot.setControlState('forward', false), humanDelay(100, 300)); }
+    else {
+      const newPitch = bot.entity.pitch + (Math.random() - 0.5) * 0.5;
+      bot.look(bot.entity.yaw + (Math.random() - 0.5) * 1.5, Math.max(-1.4, Math.min(1.4, newPitch)), false);
     }
-  });
+  }
 
-  return bot;
-}
+  function startAntiAfk() { stopAntiAfk(); if (state.antiAfkEnabled) scheduleAntiAfk(); }
+  function stopAntiAfk()  { clearTimeout(state.antiAfkTimeout); state.antiAfkTimeout = null; }
 
-// ===========================================================================
-// AUTO-LOGIN SYSTEM
-// ===========================================================================
-async function handleAutoLogin(bot, message) {
-  if (!CONFIG.password || !message) return;
-  const msg = String(message).toLowerCase();
-  const now = Date.now();
+  function startCamera() {
+    stopCamera();
+    if (!state.cameraEnabled) return;
+    function scheduleNextLook() {
+      if (!state.cameraEnabled) return;
+      state.cameraTimeout = setTimeout(() => {
+        if (!state.verifying && bot.entity) {
+          const newPitch = bot.entity.pitch + (Math.random() - 0.5) * (0.15 + Math.random() * 0.35);
+          bot.look(bot.entity.yaw + (Math.random() - 0.5) * (0.2 + Math.random() * 0.5), Math.max(-1.5, Math.min(1.5, newPitch)), false);
+        }
+        scheduleNextLook();
+      }, humanDelay(1500, 6500));
+    }
+    scheduleNextLook();
+  }
+  function stopCamera() { clearTimeout(state.cameraTimeout); state.cameraTimeout = null; }
 
-  if (now - bot._autoLogin.lastAt < 2500) return;
+  function stopAttack() {
+    if (state._swingTick) bot.removeListener('physicsTick', state._swingTick);
+    state._swingTick = null; state.attackActive = false; bot.pathfinder.stop();
+  }
 
-  const needsRegister = ['/register', 'register with', 'please register', 'register <password>'].some(x => msg.includes(x));
-  const needsLogin = ['/login', 'login with', 'please login'].some(x => msg.includes(x));
+  function toggle(key, arg, label, onCb, offCb) {
+    if      (arg === 'on')  { state[key] = true;  onCb?.();  log(`[${label}] Enabled.`);  }
+    else if (arg === 'off') { state[key] = false; offCb?.(); log(`[${label}] Disabled.`); }
+    else log(`[${label}] Currently ${state[key] ? 'ON' : 'OFF'}`);
+    emit('toggles', safeToggles());
+  }
 
-  try {
-    if (needsRegister && !bot._autoLogin.registerSent) {
-      bot._autoLogin.lastAt = now; bot._autoLogin.registerSent = true;
-      bot.chat(`/register ${CONFIG.password} ${CONFIG.password}`);
-      sendToDiscord(`🔐 Auto-registering...`);
-      await wait(1200);
-      bot.chat(`/login ${CONFIG.password}`);
+  function handleCommand(input) {
+    const trimmed = input.trim();
+    if (!trimmed) return;
+
+    if (!trimmed.startsWith('.')) {
+      bot.chat(trimmed);
+      log(`[MC] ▶ ${trimmed}`, 'mc');
       return;
     }
 
-    if (needsLogin && !bot._autoLogin.loginSent) {
-      bot._autoLogin.lastAt = now; bot._autoLogin.loginSent = true;
-      bot.chat(`/login ${CONFIG.password}`);
-      sendToDiscord(`🔓 Auto-login command sent.`);
-    }
-  } catch (err) {}
-}
+    const parts = trimmed.slice(1).split(' ');
+    const cmd   = parts[0].toLowerCase();
+    const args  = parts.slice(1);
 
-function cleanupBot(bot) {
-  if (!bot || bot._isCleaningUp) return;
-  bot._isCleaningUp = true;
-  for (const timer of bot._timers) clearInterval(timer);
-  bot._timers.length = 0;
+    switch (cmd) {
+      case 'help':
+        log('================================');
+        log('          BOT COMMANDS          ');
+        log('================================');
+        log('.move forward         -> Walk straight');
+        log('.move stop            -> Freeze bot');
+        log('.move <x> <y> <z>     -> Pathfind to coords');
+        log('.attack               -> Hit nearest mob/player');
+        log('.attack stop          -> Stop attacking');
+        log(`.autoeat [on/off]     -> Auto eating      [${state.autoEatEnabled     ? 'ON' : 'OFF'}]`);
+        log(`.antiafk [on/off]     -> Anti-AFK         [${state.antiAfkEnabled     ? 'ON' : 'OFF'}]`);
+        log(`.autorespawn [on/off] -> Auto revive      [${state.autoRespawnEnabled ? 'ON' : 'OFF'}]`);
+        log(`.camera [on/off]      -> Head movement    [${state.cameraEnabled      ? 'ON' : 'OFF'}]`);
+        log('.respawn              -> Manual respawn');
+        log('.config               -> Show config');
+        log('.stats                -> Show player stats');
+        log('.clear                -> Clear terminal');
+        log('.quit                 -> Disconnect & exit');
+        log('================================');
+        break;
 
-  if (bot._cameraTimer) clearTimeout(bot._cameraTimer); 
-
-  bot._attackLoopActive = false;
-  bot._strafing = false;
-
-  const index = bots.indexOf(bot);
-  if (index !== -1) bots.splice(index, 1);
-}
-
-function registerInterval(bot, fn, ms) {
-  const timer = setInterval(fn, ms);
-  bot._timers.push(timer);
-}
-
-function reconnectAll(reasonText) {
-  manualDisconnect = true;
-  sendToDiscord(`⏳ Disconnecting... ${reasonText}. Waiting 10 seconds to clear ghost players...`);
-  [...bots].forEach(bot => { try { bot.quit(reasonText); } catch (_) {} cleanupBot(bot); });
-  bots.length = 0;
-
-  setTimeout(() => {
-    manualDisconnect = false;
-    sendToDiscord(`🚀 Reconnecting now...`);
-    for (let i = 0; i < CONFIG.threads; i++) {
-      const name = CONFIG.threads > 1 ? `${CONFIG.baseUsername}_${Math.random().toString(36).slice(2, 6)}` : CONFIG.baseUsername;
-      setTimeout(() => createBot(name, 0), i * CONFIG.joinDelay * 1000);
-    }
-  }, 10000); 
-}
-
-// ===========================================================================
-// FEATURES 
-// ===========================================================================
-function startAntiNaNLoop(bot) {
-  bot.on('physicsTick', () => {
-    if (!bot.entity) return;
-    const p = bot.entity.position;
-    if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) p.set(0, 64, 0);
-  });
-}
-
-function setupAutoEat(bot) {
-  let eating = false;
-  bot.on('physicsTick', async () => {
-    if (!state.autoEatEnabled || eating || !bot.entity || bot.food >= CONFIG.autoEatThreshold || bot._isPanicEating) return;
-    
-    const food = bot.inventory.items().find(item => 
-      item?.name && EDIBLE_FOODS.some(foodName => item.name.toLowerCase().includes(foodName))
-    );
-    if (!food) return;
-
-    eating = true;
-    try { await bot.equip(food, 'hand'); await bot.consume(); } catch (_) {} finally { eating = false; }
-  });
-}
-
-function startAntiAfk(bot) {
-  registerInterval(bot, () => {
-    if (state.antiAfkEnabled && bot.entity) {
-      bot.setControlState('jump', true);
-      setTimeout(() => { try { bot.setControlState('jump', false); } catch (_) {} }, 250);
-    }
-  }, 45000);
-}
-
-function startHumanCamera(bot) {
-  const cameraRoutine = () => {
-    if (manualDisconnect || bots.indexOf(bot) === -1) return;
-    
-    // 🔧 FIX: Target local bot object key map vectors cleanly
-    if (state.cameraEnabled && bot.entity && !bot._afkHeadLock) {
-      if (Math.random() < 0.15) {
-        const nextInterval = 5000 + Math.random() * 6000;
-        bot._cameraTimer = setTimeout(cameraRoutine, nextInterval);
-        return;
-      }
-
-      if (!bot._lastDamageTime || (Date.now() - bot._lastDamageTime >= 3000)) {
-        const yaw = bot.entity.yaw + (Math.random() - 0.5) * 0.25;
-        const pitch = Math.max(-0.35, Math.min(0.35, bot.entity.pitch + (Math.random() - 0.5) * 0.08));
-        bot.look(yaw, pitch, true).catch(() => {});
-      }
-    }
-    
-    const nextInterval = 5000 + Math.random() * 6000; 
-    bot._cameraTimer = setTimeout(cameraRoutine, nextInterval);
-  };
-  
-  cameraRoutine();
-}
-
-function startSonarBypass(bot) {
-  registerInterval(bot, () => {
-    if (state.bypassEnabled && bot.entity) {
-      bot.setControlState('sneak', true);
-      setTimeout(() => { try { bot.setControlState('sneak', false); } catch (_) {} }, 180);
-    }
-  }, 30000 + Math.floor(Math.random() * 15000)); 
-
-  registerInterval(bot, () => {
-    if (state.bypassEnabled && bot.entity) { try { bot.swingArm('right'); } catch (_) {} }
-  }, 45000 + Math.floor(Math.random() * 20000)); 
-}
-
-// ===========================================================================
-// DISCORD COMMAND HANDLER
-// ===========================================================================
-async function handleCommand(body, discordMsg) {
-  const parts = body.split(/\s+/).filter(Boolean);
-  const cmd = (parts.shift() || '').toLowerCase();
-  const args = parts;
-  const currentBot = getPrimaryBot();
-
-  const reply = async text => {
-    if (discordMsg) try { await discordMsg.reply(text); } catch (_) {}
-    log(`[Cmd Reply] ${text}`);
-  };
-
-  switch (cmd) {
-    case 'connect':
-      if (isConnecting) return reply('⏳ Connection process already active. Please wait!');
-      
-      isConnecting = true;
-      try {
-        const newIp = args[0] || CONFIG.host;
-        const newPort = Number.parseInt(args[1], 10) || CONFIG.port;
-        
-        CONFIG.host = newIp; 
-        CONFIG.port = newPort;
-        manualDisconnect = false;
-
-        if (bots.length > 0) {
-          await reply('⏳ Cleaning up previous instances. Waiting 10s for ghost-player protection...');
-          [...bots].forEach(b => { try { b.quit(); } catch (_) {} cleanupBot(b); });
-          bots.length = 0;
-          await wait(10000); 
+      case 'move':
+        if (state.verifying) { log('[Move] Blocked — verification in progress.'); break; }
+        if      (args[0] === 'forward') { bot.setControlState('forward', true); log('[Move] Walking forward...'); }
+        else if (args[0] === 'stop')    {
+          bot.pathfinder.stop();
+          ['forward','back','left','right','jump','sprint'].forEach(k => bot.setControlState(k, false));
+          log('[Move] Stopped.');
         }
+        else if (args.length === 3) {
+          const [x, y, z] = args.map(Number);
+          if ([x,y,z].some(isNaN)) { log('[Move] Invalid coordinates.'); break; }
+          bot.pathfinder.setGoal(new goals.GoalBlock(x, y, z));
+          log(`[Move] Pathfinding to ${x} ${y} ${z}...`);
+        } else log('[Move] Usage: .move forward | stop | <x> <y> <z>');
+        break;
 
-        await reply(`🚀 Connecting to **${CONFIG.host}:${CONFIG.port}**...`);
-        for (let i = 0; i < CONFIG.threads; i++) {
-          const name = CONFIG.threads > 1 ? `${CONFIG.baseUsername}_${Math.random().toString(36).slice(2, 6)}` : CONFIG.baseUsername;
-          setTimeout(() => createBot(name, 0), i * CONFIG.joinDelay * 1000);
+      case 'attack': {
+        if (args[0] === 'stop') { stopAttack(); log('[Attack] Stopped.'); break; }
+        if (state.attackActive) { log('[Attack] Already active. Use .attack stop first.'); break; }
+        const target = bot.nearestEntity(e => e.type === 'mob') ||
+                       bot.nearestEntity(e => e.type === 'player' && e.username !== bot.username);
+        if (!target) { log('[Attack] No target found.'); break; }
+        log(`[Attack] Targeting ${target.username || target.name || target.type}`);
+        bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
+        state.attackActive = true;
+        let tickCount  = 0;
+        let tickNeeded = 12 + Math.floor(Math.random() * 6);
+        function swingTick() {
+          if (!target || !bot.entity || target.position.distanceTo(bot.entity.position) > 4.5) { stopAttack(); return; }
+          tickCount++;
+          if (tickCount >= tickNeeded) {
+            bot.attack(target); tickCount = 0; tickNeeded = 12 + Math.floor(Math.random() * 6);
+          }
         }
-      } finally {
-        isConnecting = false; 
-      }
-      break;
-
-    case 'quit':
-    case 'disconnect':
-      if (bots.length === 0) return reply('❌ Bot is already offline.');
-      manualDisconnect = true; 
-      [...bots].forEach(b => { 
-        try { b.quit('Disconnected by Master Remote'); } catch (_) {} 
-        if (b.pathfinder) b.pathfinder.setGoal(null); 
-        cleanupBot(b); 
-      });
-      bots.length = 0;
-      await reply(`🛑 Bot disconnected. Use \`${CONFIG.prefix}connect\` to join.`);
-      break;
-
-    case 'name':
-      if (!args[0]) return reply(`❌ Usage: \`${CONFIG.prefix}name <new_name>\``);
-      CONFIG.baseUsername = args[0];
-      if (bots.length === 0) {
-        await reply(`✅ Username updated to **${CONFIG.baseUsername}**.`);
-      } else {
-        await reply(`✅ Username updated to **${CONFIG.baseUsername}**. Reconnecting...`);
-        reconnectAll(`username changed`);
-      }
-      break;
-
-    case 'password':
-      if (!args[0]) return reply(`❌ Usage: \`${CONFIG.prefix}password <password>\``);
-      CONFIG.password = args[0];
-      await reply('✅ Auto-login password saved!');
-      break;
-
-    case 'mc':
-    case 'chat':
-      const textToSay = args.join(' ');
-      if (!textToSay) return reply(`❌ Usage: \`${CONFIG.prefix}mc <text/command>\``);
-      bots.forEach(b => { if (b && b.entity) b.chat(textToSay); });
-      await discordMsg.react('✅');
-      break;
-
-    case 'headlock':
-      const lockArg = (args[0] || 'on').toLowerCase();
-      state.afkHeadLock = (lockArg === 'on');
-      // 🔧 FIX: Map context iterations safely to encapsulate states multi-threadedly
-      bots.forEach(b => { b._afkHeadLock = state.afkHeadLock; });
-      await reply(`🔒 **AFK Head Lock:** ${state.afkHeadLock ? 'ENABLED (Simulation Mode / Stable Camera)' : 'DISABLED (Realism Mode / Adaptive Head Tracking)'}`);
-      break;
-
-    case 'experimentalgravity':
-      const toggle = (args[0] || 'on').toLowerCase();
-      if (toggle === 'off') {
-        bots.forEach(b => { if (b.physics) b.physics.gravity = 0; });
-        await reply('🛸 **[Experimental] Anti-Gravity ON:** Fall damage bypassed!');
-      } else {
-        bots.forEach(b => { if (b.physics) b.physics.gravity = 0.08; }); 
-        await reply('🌍 **Gravity ON:** Back to normal physics.');
-      }
-      break;
-
-    case 'status':
-      if (!currentBot || !currentBot.entity) return reply('❌ Bot is not currently online in Minecraft.');
-      const pos = currentBot.entity.position;
-      const statusEmbed = new EmbedBuilder()
-        .setColor(0x2ecc71).setTitle('🤖 Bot Status')
-        .addFields(
-          { name: 'Username', value: currentBot.username || 'Unknown', inline: true },
-          { name: 'Health', value: `${Math.round(currentBot.health ?? 0)} / 20 ❤️`, inline: true },
-          { name: 'Food', value: `${Math.round(currentBot.food ?? 0)} / 20 🍖`, inline: true },
-          { name: 'Location', value: `X: ${Math.floor(pos.x)} | Y: ${Math.floor(pos.y)} | Z: ${Math.floor(pos.z)} 📍`, inline: false },
-          { name: 'Server', value: `${CONFIG.host}:${CONFIG.port}`, inline: true },
-          { name: 'Threads', value: `${bots.length}/${CONFIG.threads}`, inline: true },
-          { name: 'AFK HeadLock', value: currentBot._afkHeadLock ? '🔒 On' : '🔓 Off', inline: true }
-        ).setTimestamp();
-      await discordMsg.channel.send({ embeds: [statusEmbed] });
-      break;
-
-    case 'inv':
-      if (!currentBot || !currentBot.entity) return reply('❌ Bot is not currently online in Minecraft.');
-      const items = currentBot.inventory.items();
-      let invText = items.length ? items.map(item => `${item.count}x ${item.displayName}`).join('\n') : 'Inventory is empty...';
-      if (invText.length > 3800) invText = `${invText.slice(0, 3800)}\n...`;
-      const invEmbed = new EmbedBuilder()
-        .setColor(0x3498db).setTitle(`🎒 Inventory - ${currentBot.username}`)
-        .setDescription(`\`\`\`\n${invText}\n\`\`\``).setTimestamp();
-      await discordMsg.channel.send({ embeds: [invEmbed] });
-      break;
-
-    case 'move':
-      const subMove = (args[0] || '').toLowerCase();
-      if (subMove === 'stop') { 
-        bots.forEach(b => { b.clearControlStates(); if (b.pathfinder) b.pathfinder.setGoal(null); });
-        await reply('🛑 All bots stopped moving.');
-      } else if (subMove === 'forward') {
-        bots.forEach(b => { if (b.entity) b.setControlState('forward', true); });
-        await reply('⬆️ Moving forward!');
-      } else {
-        const x = parseFloat(args[0]), y = parseFloat(args[1]), z = parseFloat(args[2]);
-        if (!isNaN(x) && !isNaN(y) && !isNaN(z)) {
-          bots.forEach(b => { if (b.pathfinder) b.pathfinder.setGoal(new GoalBlock(x, y, z)); });
-          await reply(`🚶 Pathfinding to X: ${x}, Y: ${y}, Z: ${z}`);
-        } else {
-          await reply(`❌ Usage: \`${CONFIG.prefix}move forward\` | \`${CONFIG.prefix}move stop\` | \`${CONFIG.prefix}move <x> <y> <z>\``);
-        }
-      }
-      break;
-
-    case 'attack':
-      const subArg = (args[0] || '').toLowerCase();
-      if (subArg === 'stop') {
-        bots.forEach(b => { 
-          b._attackLoopActive = false; 
-          try {
-            if (b.pathfinder) b.pathfinder.setGoal(null);
-            b.clearControlStates();
-          } catch (_) {}
-        });
-        await reply('🛑 Combat execution loop terminated and navigation targets purged.');
+        bot.on('physicsTick', swingTick);
+        state._swingTick = swingTick;
+        emit('toggles', safeToggles());
         break;
       }
 
-      bots.forEach(async (b) => {
-        if (!b.entity) return;
-        if (b._attackLoopActive) return; 
-        
-        b._attackLoopActive = true;
-        
-        const attackRoutine = async () => {
-          if (manualDisconnect || bots.indexOf(b) === -1 || !b._attackLoopActive) {
-            b._attackLoopActive = false;
-            return; 
-          }
+      case 'autoeat':     toggle('autoEatEnabled',     args[0], 'AutoEat');                                break;
+      case 'antiafk':     toggle('antiAfkEnabled',     args[0], 'AntiAFK',     startAntiAfk, stopAntiAfk); break;
+      case 'autorespawn': toggle('autoRespawnEnabled',  args[0], 'AutoRespawn');                            break;
+      case 'camera':      toggle('cameraEnabled',       args[0], 'Camera',      startCamera,  stopCamera);  break;
 
-          if (b._isPanicEating) {
-            setTimeout(attackRoutine, 1000);
-            return;
-          }
-          
-          const target = b.nearestEntity(e => (e.type === 'mob' || e.type === 'player') && e.id !== b.entity.id);
-          if (target) {
-            b._attackIdleCycles = 0; 
-            const distance = b.entity.position.distanceTo(target.position);
-            
-            if (distance <= CONFIG.attackReach) {
-              const baseDelay = 250; 
-              const randomJitter = Math.random() * 450; 
-              await wait(baseDelay + randomJitter);
-              try { b.attack(target); } catch (_) {}
-              setTimeout(attackRoutine, 50); 
-            } else if (distance < 12 && b.pathfinder) {
-              b.pathfinder.setGoal(new GoalFollow(target, 2), true); 
-              setTimeout(attackRoutine, 500); 
-            } else {
-              setTimeout(attackRoutine, 1000); 
-            }
-          } else {
-            b._attackIdleCycles++;
-            if (b._attackIdleCycles > 300) { 
-              sendToDiscord(`⚔️ No valid attack targets found within the last 5 minutes for **${b.username}**.`);
-              b._attackIdleCycles = 0;
-            }
-            setTimeout(attackRoutine, 1000); 
-          }
-        };
-        
-        await attackRoutine();
-      });
-      await reply('⚔️ Commencing dynamic, loop-managed humanized attack routines.');
-      break;
+      case 'respawn': bot.respawn(); log('[*] Respawn sent.'); break;
+      case 'clear':   console.clear(); break;
 
-    case 'help':
-      const helpEmbed = new EmbedBuilder()
-        .setColor(0xf1c40f).setTitle('🎮 Master Remote Commands')
-        .setDescription([
-          '**Server Control:**',
-          `\`${CONFIG.prefix}connect <ip>\` - Connect to server`,
-          `\`${CONFIG.prefix}quit\` - Disconnect from server`,
-          `\`${CONFIG.prefix}name <name>\` - Change username`,
-          `\`${CONFIG.prefix}password <pass>\` - Auto-login pass`,
-          `\`${CONFIG.prefix}headlock on/off\` - Toggle individual simulation head vectors`,
-          '',
-          '**Chat & Info:**',
-          `\`${CONFIG.prefix}mc <text>\` - Send raw command safely`,
-          `\`${CONFIG.prefix}status\` - Health/Food/Loc/Threads`,
-          `\`${CONFIG.prefix}inv\` - View Inventory`,
-          '',
-          '**Action & Hacks:**',
-          `\`${CONFIG.prefix}move forward\` / \`stop\` / \`<x> <y> <z>\``,
-          `\`${CONFIG.prefix}attack\` - Start continuous combat loop`,
-          `\`${CONFIG.prefix}attack stop\` - Stop continuous combat loop`,
-          `\`${CONFIG.prefix}experimentalgravity off/on\` - [Experimental] Anti-fall damage`,
-          '',
-          '*(Raw messages without prefix are forwarded to Minecraft chat)*'
-        ].join('\n'));
-      await discordMsg.channel.send({ embeds: [helpEmbed] });
-      break;
+      case 'stats': {
+        const s = liveStats();
+        if (!s) { log('[Stats] No bot data yet.'); break; }
+        log(`[Stats] ❤ ${s.health}/20  🍖 ${s.food}/20  ✨ Lv.${s.xpLevel}  📍 ${s.x}, ${s.y}, ${s.z}`);
+        break;
+      }
 
-    default:
-      await reply(`❌ Unknown command. Use \`${CONFIG.prefix}help\``);
-  }
-}
+      case 'config':
+        log('================================');
+        log(`  Host     : ${CONFIG.host}:${CONFIG.port}`);
+        log(`  Username : ${CONFIG.username}`);
+        log(`  Password : ${CONFIG.password ? '(set)' : '(none)'}`);
+        log(`  Version  : ${CONFIG.version}`);
+        log(`  Auth     : ${CONFIG.auth}`);
+        log(`  Reconnect: #${reconnectAttempts}`);
+        log('================================');
+        break;
 
-// ===========================================================================
-// STARTUP & SECURITY SAFEGUARDS
-// ===========================================================================
-log(`[+] Discord Web Server is Online. Waiting for '${CONFIG.prefix}connect' command to join Minecraft...`);
+      case 'quit':
+      case 'exit':
+        log('[Cmd] Shutting down...');
+        stopAttack(); bot.removeAllListeners(); bot.quit();
+        setTimeout(() => process.exit(0), 1000);
+        break;
 
-if (!CONFIG.guiToken) {
-  log(`[!] CRITICAL WARNING: GUI_TOKEN environment variable is empty. The Interactive Dashboard (/gui) is completely LOCKED for security by default.`);
-}
-
-// ===========================================================================
-// WEB SERVER 
-// ===========================================================================
-const app = express();
-
-app.get('/', (_req, res) => {
-  res.send('<h1>Discord Master Remote is Online!</h1><p>Append your dynamic gateway token to access layout matrices securely.</p>');
-});
-
-app.post('/click-slot/:slotId', async (req, res) => {
-  const token = req.query.token;
-  if (!CONFIG.guiToken || token !== CONFIG.guiToken) {
-    return res.status(403).json({ error: 'Forbidden: Invalid or missing secure query authorization token.' });
-  }
-
-  const bot = getPrimaryBot();
-  const slotId = Number.parseInt(req.params.slotId, 10);
-
-  if (!bot || !bot.entity) {
-    return res.status(503).json({ error: 'Bot offline' });
-  }
-  if (Number.isNaN(slotId) || slotId < 0 || slotId > 45) {
-    return res.status(400).json({ error: 'Invalid slot structure ID' });
-  }
-
-  try {
-    await bot.clickWindow(slotId, 0, 0);
-    return res.json({ success: true, clicked: slotId });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/gui', (_req, res) => {
-  const token = _req.query.token;
-  if (!CONFIG.guiToken || token !== CONFIG.guiToken) {
-    return res.status(403).send(`
-      <html>
-        <head><title>403 Forbidden</title><style>body { background: #1a1a1a; color: #ff5555; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }</style></head>
-        <body><div style="text-align: center;"><h2>🔒 403 Forbidden</h2><p>Access Denied. Missing or invalid query string authentication token.</p></div></body>
-      </html>
-    `);
-  }
-
-  const bot = getPrimaryBot();
-  if (!bot || !bot.entity) {
-    return res.send(`
-      <html>
-        <head>
-          <title>Inventory Web GUI</title>
-          <style>
-            body { background: #1a1a1a; color: #ff5555; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-            .container { text-align: center; border: 2px solid #ff5555; padding: 20px; border-radius: 8px; background: #222; }
-          </style>
-        </head>
-        <body>
-          <div class="container">
-            <h2>🚨 Bot Offline / Not Spawned</h2>
-            <p>Discord console se pehle <b>${CONFIG.prefix}connect</b> run karein!</p>
-          </div>
-        </body>
-      </html>
-    `);
-  }
-
-  let slotElementsHTML = '';
-  for (let slotIndex = 0; slotIndex < 45; slotIndex++) {
-    const item = bot.inventory.slots[slotIndex];
-    if (item) {
-      slotElementsHTML += `
-        <div class="slot-box occupied" onclick="triggerSlotClick(${slotIndex})" title="Type: ${item.name} | Click to interact">
-          <span class="item-name">${item.displayName}</span>
-          <span class="item-count">${item.count}</span>
-        </div>
-      `;
-    } else {
-      slotElementsHTML += `<div class="slot-box empty" onclick="triggerSlotClick(${slotIndex})" title="Empty Slot ${slotIndex}"></div>`;
+      default:
+        log(`[Cmd] Unknown: .${cmd}  (type .help)`);
     }
   }
 
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>🤖 CloudBot Secured Control Panel</title>
-      <style>
-        body { background: #2c2520; color: #e1e1e1; font-family: 'Courier New', monospace; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; user-select: none; }
-        h1 { color: #ffaa00; text-shadow: 2px 2px #000; margin-bottom: 5px; }
-        .bot-meta { margin-bottom: 20px; color: #55ff55; font-size: 14px; background: #14110f; padding: 8px 15px; border: 2px solid #3c3530; border-radius: 4px; }
-        .inventory-gui-panel { background: #c6c6c6; border: 4px solid #3c3c3c; border-top-color: #ffffff; border-left-color: #ffffff; padding: 12px; border-radius: 2px; box-shadow: 5px 5px 0px #000; display: grid; grid-template-columns: repeat(9, 60px); gap: 4px; }
-        .slot-box { width: 60px; height: 60px; background: #8b8b8b; border: 3px solid #3c3c3c; border-right-color: #ffffff; border-bottom-color: #ffffff; box-sizing: border-box; position: relative; display: flex; justify-content: center; align-items: center; text-align: center; overflow: hidden; padding: 2px; cursor: pointer; }
-        .slot-box:active { border-color: #ffffff; border-right-color: #3c3c3c; border-bottom-color: #3c3c3c; padding-top: 4px; padding-left: 4px; }
-        .item-name { font-size: 9px; color: #1a1a1a; font-weight: bold; line-height: 11px; word-break: break-word; text-shadow: 0.5px 0.5px #fff; pointer-events: none; }
-        .item-count { position: absolute; bottom: 2px; right: 4px; font-size: 12px; color: #ffff55; font-weight: bold; text-shadow: 2px 2px #000000; pointer-events: none; }
-        .footer-note { margin-top: 25px; color: #aaa; font-size: 11px; text-shadow: 1px 1px #000; text-align: center; max-width: 500px; }
-      </style>
-      <script>
-        const urlParams = new URLSearchParams(window.location.search);
-        const activeToken = urlParams.get('token') || '';
+  currentHandleCommand = handleCommand;
+  return handleCommand;
+}
 
-        function triggerSlotClick(id) {
-          fetch('/click-slot/' + id + '?token=' + activeToken, { method: 'POST' })
-            .then(res => {
-              if(!res.ok) throw new Error('Click payload rejected');
-              return res.json();
-            })
-            .then(data => {
-              window.location.reload(); 
-            })
-            .catch(err => console.error(err));
-        }
-      </script>
-    </head>
-    <body>
-      <h1>🔒 SECURED BOT CONTROL</h1>
-      <div class="bot-meta">
-        🟢 <b>Bot Active:</b> ${bot.username} | ❤️ <b>HP:</b> ${Math.round(bot.health)}/20 | 🍗 <b>Food:</b> ${bot.food}/20 | 📍 <b>Loc:</b> X:${Math.floor(bot.entity.position.x)} Y:${Math.floor(bot.entity.position.y)}
-      </div>
-      
-      <div class="inventory-gui-panel">
-        ${slotElementsHTML}
-      </div>
-      
-      <div class="footer-note">ℹ️ Token Authorization validation active. Current Thread HeadLock Mode: <b>${bot._afkHeadLock ? '🔒 ON (Simulation Mode)' : '🔓 OFF (Realism Mode)'}</b>.</div>
-    </body>
-    </html>
-  `);
-});
+// ─── GUI HTML ─────────────────────────────────────────────────────────────────
+const GUI_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mineflayer Bot Console</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-app.listen(process.env.PORT || 3000, () => log('[+] Web server started.'));
+  :root {
+    --bg:        #0d1117;
+    --panel:     #161b22;
+    --panel2:    #1c2128;
+    --border:    #30363d;
+    --green:     #3fb950;
+    --red:       #f85149;
+    --yellow:    #d29922;
+    --blue:      #58a6ff;
+    --purple:    #bc8cff;
+    --orange:    #ffa657;
+    --text:      #e6edf3;
+    --muted:     #7d8590;
+    --dim:       #484f58;
+    --radius:    8px;
+  }
+
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; font-size: 13px; overflow: hidden; }
+
+  .layout { display: grid; grid-template-columns: 200px 1fr 190px; grid-template-rows: 48px 1fr 48px; height: 100vh; gap: 0; }
+
+  header {
+    grid-column: 1 / -1;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 16px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  .header-left  { display: flex; align-items: center; gap: 10px; }
+  .logo-icon    { font-size: 18px; }
+  .logo-text    { font-weight: 700; font-size: 14px; letter-spacing: .3px; }
+  .logo-sub     { font-size: 11px; color: var(--muted); }
+  .conn-badge   { display: flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; background: var(--panel2); border: 1px solid var(--border); transition: all .3s; }
+  .conn-dot     { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); transition: background .3s; }
+  .conn-badge.online  { border-color: var(--green); color: var(--green); }
+  .conn-badge.online .conn-dot { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; }
+  .conn-badge.error   { border-color: var(--red);   color: var(--red); }
+  .conn-badge.error .conn-dot { background: var(--red); }
+  .conn-badge.waiting { border-color: var(--yellow); color: var(--yellow); }
+  .conn-badge.waiting .conn-dot { background: var(--yellow); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  .sidebar-left {
+    grid-row: 2;
+    background: var(--panel); border-right: 1px solid var(--border);
+    padding: 14px 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px;
+  }
+
+  .section-label { font-size: 10px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px; }
+
+  .info-row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; }
+  .info-key { color: var(--muted); font-size: 11px; }
+  .info-val { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text); max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .stat-bar-wrap  { margin-bottom: 8px; }
+  .stat-bar-label { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 3px; }
+  .stat-bar-track { height: 5px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
+  .stat-bar-fill  { height: 100%; border-radius: 3px; transition: width .6s ease; }
+  .stat-health .stat-bar-fill { background: var(--red); }
+  .stat-food   .stat-bar-fill { background: var(--orange); }
+  .stat-xp     .stat-bar-fill { background: var(--green); }
+
+  .pos-box  { background: var(--panel2); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px; font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.8; }
+  .pos-axis { color: var(--muted); }
+
+  /* ── Log panel: pure black background like MC chat ── */
+  .log-panel {
+    grid-row: 2;
+    background: #000000;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .log-toolbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  .log-filters { display: flex; gap: 4px; }
+  .filter-btn {
+    padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border); background: transparent;
+    color: var(--muted); font-size: 11px; cursor: pointer; transition: all .15s;
+  }
+  .filter-btn.active { background: var(--panel2); color: var(--text); border-color: var(--dim); }
+  .log-output {
+    flex: 1; overflow-y: auto; padding: 10px 14px;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.65;
+    display: flex; flex-direction: column; gap: 1px;
+  }
+  .log-output::-webkit-scrollbar       { width: 5px; }
+  .log-output::-webkit-scrollbar-track { background: transparent; }
+  .log-output::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+  .log-line { display: flex; gap: 8px; align-items: baseline; opacity: 0; animation: fadeIn .15s forwards; }
+  .log-time { color: #555555; font-size: 10px; flex-shrink: 0; }
+  .log-msg  { word-break: break-word; flex: 1; }
+
+  /* ── Exact Minecraft §color palette ── */
+  .log-line.chat    .log-msg { color: #FFFFFF; }   /* §f white  — normal chat  */
+  .log-line.system  .log-msg { color: #55FF55; }   /* §a green  — system info  */
+  .log-line.error   .log-msg { color: #FF5555; }   /* §c red    — errors/kicks */
+  .log-line.sonar   .log-msg { color: #FF55FF; }   /* §d pink   — sonar events */
+  .log-line.auth    .log-msg { color: #FFAA00; }   /* §6 gold   — auth/login   */
+  .log-line.move    .log-msg { color: #55FFFF; }   /* §b aqua   — movement     */
+  .log-line.attack  .log-msg { color: #FF5555; }   /* §c red    — combat       */
+  .log-line.gui     .log-msg { color: #AAAAAA; }   /* §7 gray   — gui/internal */
+  .log-line.mc      .log-msg { color: #55FF55; font-weight: 500; } /* §a green — sent cmds */
+
+  @keyframes fadeIn { from{opacity:0;transform:translateY(2px)} to{opacity:1;transform:none} }
+
+  .sidebar-right {
+    grid-row: 2;
+    background: var(--panel); border-left: 1px solid var(--border);
+    padding: 14px 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px;
+  }
+
+  .toggle-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 7px 0; border-bottom: 1px solid var(--border);
+  }
+  .toggle-row:last-child { border-bottom: none; }
+  .toggle-label { font-size: 12px; }
+  .toggle-switch { position: relative; width: 32px; height: 18px; cursor: pointer; }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; }
+  .toggle-track { position: absolute; inset: 0; background: var(--dim); border-radius: 9px; transition: background .2s; }
+  .toggle-switch input:checked + .toggle-track { background: var(--green); }
+  .toggle-thumb { position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; background: white; border-radius: 50%; transition: transform .2s; }
+  .toggle-switch input:checked ~ .toggle-thumb { transform: translateX(14px); }
+
+  .action-btn {
+    width: 100%; padding: 7px 10px; border: 1px solid var(--border); background: var(--panel2);
+    color: var(--text); border-radius: 6px; cursor: pointer; font-size: 12px;
+    text-align: left; margin-bottom: 5px; transition: all .15s;
+  }
+  .action-btn:hover { background: var(--bg); border-color: var(--dim); }
+  .action-btn .btn-icon { margin-right: 6px; }
+
+  .reconnect-box {
+    background: rgba(210,153,34,.08); border: 1px solid rgba(210,153,34,.3);
+    border-radius: var(--radius); padding: 8px 10px; font-size: 11px;
+    color: var(--yellow); display: none;
+  }
+  .reconnect-box.visible { display: block; }
+
+  footer {
+    grid-column: 1 / -1;
+    display: flex; align-items: center; gap: 8px;
+    padding: 0 12px;
+    background: var(--panel); border-top: 1px solid var(--border);
+  }
+  .cmd-prompt { color: var(--green); font-family: 'JetBrains Mono', monospace; font-size: 13px; flex-shrink: 0; }
+  #cmdInput {
+    flex: 1; background: transparent; border: none; outline: none;
+    color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 13px;
+    caret-color: var(--green);
+  }
+  #cmdInput::placeholder { color: var(--dim); }
+  .send-btn {
+    padding: 6px 14px; background: var(--green); color: #0d1117;
+    border: none; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer;
+    transition: opacity .15s;
+  }
+  .send-btn:hover { opacity: .85; }
+
+  .empty-state { color: #AAAAAA; font-size: 12px; text-align: center; margin-top: 40px; }
+</style>
+</head>
+<body>
+<div class="layout">
+
+  <header>
+    <div class="header-left">
+      <span class="logo-icon">⛏</span>
+      <div>
+        <div class="logo-text">Mineflayer Bot Console</div>
+        <div class="logo-sub" id="serverLabel">Connecting...</div>
+      </div>
+    </div>
+    <div class="conn-badge" id="connBadge">
+      <div class="conn-dot"></div>
+      <span id="connText">Offline</span>
+    </div>
+  </header>
+
+  <aside class="sidebar-left">
+    <div>
+      <div class="section-label">Server</div>
+      <div class="info-row"><span class="info-key">Host</span><span class="info-val" id="siHost">—</span></div>
+      <div class="info-row"><span class="info-key">Port</span><span class="info-val" id="siPort">—</span></div>
+      <div class="info-row"><span class="info-key">User</span><span class="info-val" id="siUser">—</span></div>
+      <div class="info-row"><span class="info-key">Auth</span><span class="info-val" id="siAuth">—</span></div>
+      <div class="info-row"><span class="info-key">Ver.</span><span class="info-val"  id="siVer">—</span></div>
+    </div>
+
+    <div>
+      <div class="section-label">Player Stats</div>
+      <div class="stat-bar-wrap stat-health">
+        <div class="stat-bar-label"><span>❤ Health</span><span id="stHealth">—</span></div>
+        <div class="stat-bar-track"><div class="stat-bar-fill" id="barHealth" style="width:0%"></div></div>
+      </div>
+      <div class="stat-bar-wrap stat-food">
+        <div class="stat-bar-label"><span>🍖 Food</span><span id="stFood">—</span></div>
+        <div class="stat-bar-track"><div class="stat-bar-fill" id="barFood" style="width:0%"></div></div>
+      </div>
+      <div class="stat-bar-wrap stat-xp">
+        <div class="stat-bar-label"><span>✨ XP Level</span><span id="stXP">—</span></div>
+        <div class="stat-bar-track"><div class="stat-bar-fill" id="barXP" style="width:0%"></div></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-label">Position</div>
+      <div class="pos-box">
+        <div><span class="pos-axis">X </span><span id="posX">—</span></div>
+        <div><span class="pos-axis">Y </span><span id="posY">—</span></div>
+        <div><span class="pos-axis">Z </span><span id="posZ">—</span></div>
+      </div>
+    </div>
+
+    <div class="reconnect-box" id="reconnectBox">
+      ↺ Reconnecting...<br>
+      Attempt <span id="rcAttempt">—</span> · in <span id="rcDelay">—</span>s
+    </div>
+  </aside>
+
+  <main class="log-panel">
+    <div class="log-toolbar">
+      <div class="log-filters">
+        <button class="filter-btn active" data-filter="all">All</button>
+        <button class="filter-btn" data-filter="chat"  style="color:#FFFFFF">Chat</button>
+        <button class="filter-btn" data-filter="error" style="color:#FF5555">Errors</button>
+        <button class="filter-btn" data-filter="sonar" style="color:#FF55FF">Sonar</button>
+        <button class="filter-btn" data-filter="auth"  style="color:#FFAA00">Auth</button>
+      </div>
+      <button class="filter-btn" id="clearLogBtn">Clear</button>
+    </div>
+    <div class="log-output" id="logOutput">
+      <div class="empty-state">Waiting for bot to connect...</div>
+    </div>
+  </main>
+
+  <aside class="sidebar-right">
+    <div>
+      <div class="section-label">Features</div>
+      <div class="toggle-row">
+        <span class="toggle-label">Auto Eat</span>
+        <label class="toggle-switch">
+          <input type="checkbox" id="tAutoEat" onchange="sendToggle('autoeat', this.checked)">
+          <div class="toggle-track"></div><div class="toggle-thumb"></div>
+        </label>
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">Anti AFK</span>
+        <label class="toggle-switch">
+          <input type="checkbox" id="tAntiAfk" onchange="sendToggle('antiafk', this.checked)">
+          <div class="toggle-track"></div><div class="toggle-thumb"></div>
+        </label>
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">Auto Respawn</span>
+        <label class="toggle-switch">
+          <input type="checkbox" id="tAutoRespawn" onchange="sendToggle('autorespawn', this.checked)">
+          <div class="toggle-track"></div><div class="toggle-thumb"></div>
+        </label>
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">Camera</span>
+        <label class="toggle-switch">
+          <input type="checkbox" id="tCamera" onchange="sendToggle('camera', this.checked)">
+          <div class="toggle-track"></div><div class="toggle-thumb"></div>
+        </label>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-label">Quick Actions</div>
+      <button class="action-btn" onclick="send('.stats')">   <span class="btn-icon">📊</span>Show Stats</button>
+      <button class="action-btn" onclick="send('.respawn')"> <span class="btn-icon">💫</span>Respawn</button>
+      <button class="action-btn" onclick="send('.attack')">  <span class="btn-icon">⚔️</span>Attack Nearest</button>
+      <button class="action-btn" onclick="send('.attack stop')"><span class="btn-icon">🛑</span>Stop Attack</button>
+      <button class="action-btn" onclick="send('.move stop')"><span class="btn-icon">🚫</span>Stop Moving</button>
+      <button class="action-btn" onclick="send('.config')">  <span class="btn-icon">⚙️</span>Show Config</button>
+    </div>
+  </aside>
+
+  <footer>
+    <span class="cmd-prompt">&gt;</span>
+    <input id="cmdInput" type="text" placeholder="Type to chat / type /command / use .help for bot commands" autocomplete="off" spellcheck="false">
+    <button class="send-btn" onclick="sendInput()">Send</button>
+  </footer>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+  const socket = io();
+  let activeFilter = 'all';
+  let logLines = [];
+
+  socket.on('status', d => {
+    const badge  = document.getElementById('connBadge');
+    const dot    = document.getElementById('connText');
+    const server = document.getElementById('serverLabel');
+    const rcBox  = document.getElementById('reconnectBox');
+
+    document.getElementById('siHost').textContent = d.host   || '—';
+    document.getElementById('siPort').textContent = d.port   || '—';
+    document.getElementById('siUser').textContent = d.username || '—';
+    document.getElementById('siAuth').textContent = d.auth   || '—';
+    document.getElementById('siVer').textContent  = d.version || '—';
+    server.textContent = d.host ? d.host + ':' + d.port : 'Connecting...';
+
+    if (d.connected) {
+      badge.className = 'conn-badge online'; dot.textContent = 'Online';
+      rcBox.classList.remove('visible');
+    } else if (d.reconnecting) {
+      badge.className = 'conn-badge waiting'; dot.textContent = 'Reconnecting';
+      document.getElementById('rcAttempt').textContent = d.attempt || '?';
+      document.getElementById('rcDelay').textContent   = d.nextRetry || '?';
+      rcBox.classList.add('visible');
+    } else {
+      badge.className = 'conn-badge error'; dot.textContent = 'Offline';
+    }
+  });
+
+  socket.on('log', d => {
+    const empty = document.querySelector('.empty-state');
+    if (empty) empty.remove();
+    logLines.push(d);
+    if (logLines.length > 2000) logLines.shift();
+    appendLogLine(d);
+  });
+
+  socket.on('stats', d => {
+    document.getElementById('stHealth').textContent = d.health + '/20';
+    document.getElementById('stFood').textContent   = d.food   + '/20';
+    document.getElementById('stXP').textContent     = 'Lv.' + d.xpLevel;
+    document.getElementById('barHealth').style.width = ((d.health / 20) * 100) + '%';
+    document.getElementById('barFood').style.width   = ((d.food   / 20) * 100) + '%';
+    document.getElementById('barXP').style.width     = Math.min(d.xpLevel * 5, 100) + '%';
+    document.getElementById('posX').textContent = d.x;
+    document.getElementById('posY').textContent = d.y;
+    document.getElementById('posZ').textContent = d.z;
+  });
+
+  socket.on('toggles', d => {
+    setToggle('tAutoEat',     d.autoEatEnabled);
+    setToggle('tAntiAfk',     d.antiAfkEnabled);
+    setToggle('tAutoRespawn', d.autoRespawnEnabled);
+    setToggle('tCamera',      d.cameraEnabled);
+  });
+
+  const MC_COLORS = {
+    '0':'#000000','1':'#0000AA','2':'#00AA00','3':'#00AAAA',
+    '4':'#AA0000','5':'#AA00AA','6':'#FFAA00','7':'#AAAAAA',
+    '8':'#555555','9':'#5555FF','a':'#55FF55','b':'#55FFFF',
+    'c':'#FF5555','d':'#FF55FF','e':'#FFFF55','f':'#FFFFFF',
+  };
+  function motdToHtml(str) {
+    if (!str) return '';
+    let out = ''; let spans = 0;
+    const close = () => { let s = ''; for (let j=0;j<spans;j++) s+='</span>'; spans=0; return s; };
+    for (let i = 0; i < str.length; i++) {
+      const ch = str[i];
+      if (ch === '\u00A7' && i + 1 < str.length) {
+        const code = str[i+1].toLowerCase(); i++;
+        if (MC_COLORS[code]) { out += close() + '<span style="color:' + MC_COLORS[code] + '">'; spans++; }
+        else if (code === 'l') { out += '<span style="font-weight:bold">'; spans++; }
+        else if (code === 'o') { out += '<span style="font-style:italic">'; spans++; }
+        else if (code === 'n') { out += '<span style="text-decoration:underline">'; spans++; }
+        else if (code === 'r') { out += close(); }
+      } else {
+        if      (ch === '&') out += '&amp;';
+        else if (ch === '<') out += '&lt;';
+        else if (ch === '>') out += '&gt;';
+        else out += ch;
+      }
+    }
+    return out + close();
+  }
+
+  function appendLogLine(d) {
+    if (activeFilter !== 'all' && d.type !== activeFilter) return;
+    const el = document.createElement('div');
+    el.className = 'log-line ' + (d.type || 'system');
+    el.dataset.type = d.type || 'system';
+    const bodyHtml = (d.type === 'chat' && d.motd) ? motdToHtml(d.motd) : escapeHtml(d.msg);
+    el.innerHTML = '<span class="log-time">' + escapeHtml(d.time) + '</span>' +
+                   '<span class="log-msg">'  + bodyHtml + '</span>';
+    const out = document.getElementById('logOutput');
+    out.appendChild(el);
+    out.scrollTop = out.scrollHeight;
+    while (out.childElementCount > 500) out.removeChild(out.firstChild);
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  document.querySelectorAll('.filter-btn[data-filter]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filter-btn[data-filter]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      activeFilter = btn.dataset.filter;
+      const out = document.getElementById('logOutput');
+      out.innerHTML = '';
+      logLines.forEach(d => { if (activeFilter === 'all' || d.type === activeFilter) appendLogLine(d); });
+    });
+  });
+
+  document.getElementById('clearLogBtn').addEventListener('click', () => {
+    logLines = [];
+    document.getElementById('logOutput').innerHTML = '<div class="empty-state">Log cleared.</div>';
+  });
+
+  function send(cmd) { socket.emit('command', cmd); }
+
+  function sendInput() {
+    const input = document.getElementById('cmdInput');
+    const val   = input.value.trim();
+    if (!val) return;
+    send(val);
+    input.value = '';
+  }
+
+  function sendToggle(feature, on) { send('.' + feature + ' ' + (on ? 'on' : 'off')); }
+  function setToggle(id, val) { const el = document.getElementById(id); if (el) el.checked = !!val; }
+
+  document.getElementById('cmdInput').addEventListener('keydown', e => { if (e.key === 'Enter') sendInput(); });
+</script>
+</body>
+</html>`;
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+(async () => {
+  CONFIG = await getConfig();
+  tryStartGUI();
+  const handleCommand = createBot();
+  const rl = readline.createInterface({ input: process.stdin });
+  rl.on('line', line => handleCommand(line.trim()));
+})();
