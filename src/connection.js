@@ -109,47 +109,6 @@ async function connect() {
     }
   });
 
-  // ── entity_velocity (knockback) ──────────────────────────────────────────
-  // Root cause of the "no knockback" bug:
-  // When hit, the server sends TWO packets back-to-back in the same TCP
-  // stream: entity_velocity (the knockback) then position_and_look (a
-  // position correction). Mineflayer processes position_and_look internally
-  // and zeros bot.entity.velocity BEFORE emitting the 'forcedMove' event —
-  // so by the time our code sees anything, the velocity has already been
-  // wiped.
-  //
-  // Fix: intercept entity_velocity at the raw _client level (before
-  // mineflayer processes it), store the velocity vector, then re-apply it
-  // after forcedMove resets it. We also apply immediately here to handle the
-  // reverse ordering (position_and_look arriving before entity_velocity).
-  let pendingVelocity   = null;
-  let pendingVelocityTs = 0;
-  const VELOCITY_TTL_MS = 250; // window in which a stored velocity is still considered "fresh"
-
-  bot._client.on('entity_velocity', (data) => {
-    if (!bot.entity || data.entityId !== bot.entity.id) return;
-
-    // Field names vary by minecraft-protocol version — find whichever exists.
-    const vx = data.velocityX ?? data.velX ?? 0;
-    const vy = data.velocityY ?? data.velY ?? 0;
-    const vz = data.velocityZ ?? data.velZ ?? 0;
-
-    // Protocol encodes velocity as 1/8000 of a block per game tick.
-    const vel = { x: vx / 8000, y: vy / 8000, z: vz / 8000 };
-
-    // Apply immediately — handles the case where this arrives AFTER the
-    // position correction already zeroed the velocity.
-    bot.entity.velocity.x = vel.x;
-    bot.entity.velocity.y = vel.y;
-    bot.entity.velocity.z = vel.z;
-
-    // Also store for re-application if a forcedMove arrives shortly after.
-    pendingVelocity   = vel;
-    pendingVelocityTs = Date.now();
-
-    logger.log(`[Velocity] Knockback received: vx=${vel.x.toFixed(3)} vy=${vel.y.toFixed(3)} vz=${vel.z.toFixed(3)}`);
-  });
-
   // ── forcedMove (Sonar verification) ─────────────────────────────────────
   // Tracks roughly where the bot was as of the last completed tick, purely
   // so the handler below can tell a real verification teleport (large jump)
@@ -174,26 +133,7 @@ async function connect() {
       // a knockback-induced correction while just standing around) is left
       // alone entirely — no log, no physics freeze — so physics/knockback
       // plays out naturally instead of being treated as anti-cheat noise.
-      if (jumpDistance < VERIFICATION_JUMP_THRESHOLD) {
-        // Re-apply any knockback velocity that arrived before this position
-        // reset (mineflayer zeroes bot.entity.velocity inside its forcedMove
-        // internals, before this event fires). setImmediate yields past the
-        // reset so our write lands after it rather than being overwritten.
-        if (pendingVelocity && (Date.now() - pendingVelocityTs) < VELOCITY_TTL_MS) {
-          const vel = pendingVelocity;
-          pendingVelocity = null;
-          setImmediate(() => {
-            const liveBot = state.getBot();
-            if (liveBot?.entity) {
-              liveBot.entity.velocity.x = vel.x;
-              liveBot.entity.velocity.y = vel.y;
-              liveBot.entity.velocity.z = vel.z;
-              logger.log(`[Velocity] Re-applied after position reset: vx=${vel.x.toFixed(3)} vy=${vel.y.toFixed(3)} vz=${vel.z.toFixed(3)}`);
-            }
-          });
-        }
-        return;
-      }
+      if (jumpDistance < VERIFICATION_JUMP_THRESHOLD) return;
 
       state.flags.verifying = true;
       logger.log('[Sonar] Teleported — letting physics settle...');
