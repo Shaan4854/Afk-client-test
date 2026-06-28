@@ -126,16 +126,16 @@ async function connect() {
   let pendingVelocityTs = 0;
   const VELOCITY_TTL_MS = 250; // window in which a stored velocity is still considered "fresh"
 
-  bot._client.on('packet', (data, meta) => {
-    if (meta.name !== 'entity_velocity') return;
+  bot._client.on('entity_velocity', (data) => {
     if (!bot.entity || data.entityId !== bot.entity.id) return;
 
+    // Field names vary by minecraft-protocol version — find whichever exists.
+    const vx = data.velocityX ?? data.velX ?? 0;
+    const vy = data.velocityY ?? data.velY ?? 0;
+    const vz = data.velocityZ ?? data.velZ ?? 0;
+
     // Protocol encodes velocity as 1/8000 of a block per game tick.
-    const vel = {
-      x: data.velocityX / 8000,
-      y: data.velocityY / 8000,
-      z: data.velocityZ / 8000,
-    };
+    const vel = { x: vx / 8000, y: vy / 8000, z: vz / 8000 };
 
     // Apply immediately — handles the case where this arrives AFTER the
     // position correction already zeroed the velocity.
