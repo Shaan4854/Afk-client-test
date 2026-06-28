@@ -63,6 +63,7 @@ function dispatch(bot, trimmed) {
       logger.log(`.autorespawn [on/off] -> Auto revive      [${state.flags.autoRespawnEnabled ? 'ON' : 'OFF'}]`);
       logger.log(`.camera [on/off]      -> Head movement    [${state.flags.cameraEnabled      ? 'ON' : 'OFF'}]`);
       logger.log('.respawn              -> Manual respawn');
+      logger.log('.knockback            -> Test physics (applies local impulse)');
       logger.log('.config               -> Show config');
       logger.log('.stats                -> Show player stats');
       logger.log('.clear                -> Clear terminal');
@@ -116,6 +117,20 @@ function dispatch(bot, trimmed) {
 
     case 'respawn': bot.respawn(); logger.log('[*] Respawn sent.'); break;
     case 'clear':   console.clear(); break;
+
+    case 'knockback': {
+      // Simulate a knockback impulse locally — useful to confirm physics is
+      // working end-to-end without needing another player to hit the bot.
+      // Applies a ~half-sword-hit worth of velocity toward the bot's facing
+      // direction (inverted, so it flies backwards) + upward component.
+      if (!bot.entity) { logger.log('[Knockback] No entity yet.'); break; }
+      const yaw = bot.entity.yaw;
+      bot.entity.velocity.x = -Math.sin(yaw) * 0.4;
+      bot.entity.velocity.y = 0.4;
+      bot.entity.velocity.z = -Math.cos(yaw) * 0.4;
+      logger.log('[Knockback] Test impulse applied — bot should visibly move if physics is live.');
+      break;
+    }
 
     case 'stats': {
       const s = state.liveStats();
