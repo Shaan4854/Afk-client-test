@@ -199,15 +199,6 @@ async function connect() {
       logger.log('[Sonar] Teleported — letting physics settle...');
       bot.pathfinder.stop();
       ['forward','back','left','right','jump','sprint','sneak'].forEach(k => bot.setControlState(k, false));
-      // Disable physics for ~2 ticks only (not the whole verify window) so
-      // gravity/knockback still work. Closes the gap where mineflayer's local
-      // state is behind the server's chunk data right after a teleport.
-      bot.physicsEnabled = false;
-      clearTimeout(state.handles.physicsResumeTimeout);
-      state.handles.physicsResumeTimeout = setTimeout(() => {
-        bot.physicsEnabled = true;
-        state.handles.physicsResumeTimeout = null;
-      }, 150);
     }
     // Once a verification window is already open, any further forcedMove —
     // regardless of size — extends it. Debounced into one timer instead of
