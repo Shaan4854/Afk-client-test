@@ -39,6 +39,7 @@ async function getConfig() {
     console.log(`    Password : ${saved.password ? '(set)' : '(none)'}`);
     console.log(`    Version  : ${saved.version || 'auto-detect'}`);
     console.log(`    Auth     : ${saved.auth}`);
+    console.log(`    JoinCmd  : ${saved.joinCommand || '(none)'}`);
     const use = await prompt(rl, 'Use saved config? [Y/n]: ');
     if (!use || use.toLowerCase() === 'y') { rl.close(); console.log('================================\n'); return saved; }
   }
@@ -66,9 +67,12 @@ async function getConfig() {
   let guiPortRaw = await prompt(rl, `GUI port    [${saved?.guiPort || 3000}]: `);
   const guiPort  = parseInt(guiPortRaw) || saved?.guiPort || 3000;
 
+  let joinCommand = await prompt(rl, `Join cmd    [${saved?.joinCommand || 'none'}] (e.g. /server lifesteal — blank to skip): `);
+  if (!joinCommand) joinCommand = saved?.joinCommand || '';
+
   rl.close();
 
-  const cfg = { host, port, username, password, version, auth, guiPort };
+  const cfg = { host, port, username, password, version, auth, guiPort, joinCommand };
 
   const rl2  = readline.createInterface({ input: process.stdin, output: process.stdout });
   const save = await prompt(rl2, 'Save config? [Y/n]: ');
