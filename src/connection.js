@@ -275,6 +275,14 @@ async function connect() {
     }
     logger.log(`[!] Kicked: ${readable}`);
     const lower = readable.toLowerCase();
+    if (lower.includes('internal error')) {
+      // BungeeCord server switch — the proxy kicks with "internal error" when
+      // transferring to a sub-server because Mineflayer doesn't implement the
+      // mid-session re-login sequence. Reconnecting immediately causes BungeeCord
+      // to redirect the bot to the sub-server it was switching to.
+      logger.log('[Bungee] Server transfer detected — reconnecting to sub-server...');
+      return; // let the 'end' handler reconnect normally
+    }
     if (lower.includes('bot verification')) logger.log('[Sonar] ⚠  Failed: gravity/main check');
     else if (lower.includes('too many'))    logger.log('[Sonar] ⚠  Failed: reconnect rate-limit — backing off');
     else if (lower.includes('captcha'))     logger.log('[Sonar] ⚠  Failed: CAPTCHA (map-image)');
