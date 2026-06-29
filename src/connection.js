@@ -8,6 +8,7 @@ const state    = require('./state');
 const logger   = require('./logger');
 const bus      = require('./bus');
 const features = require('./features');
+const resourcePack = require('./resourcepack');
 const { humanDelay, reconnectDelay, versionAtLeast, extractText } = require('./util');
 
 // ─── Version resolution ──────────────────────────────────────────────────────
@@ -92,6 +93,7 @@ async function connect() {
   state.setBot(bot);
   state.flags.loggedIn = false;
   bot.loadPlugin(pathfinder);
+  resourcePack.register(bot);
 
   // ── tick_end (1.21.2+) ──────────────────────────────────────────────────
   // Since 1.21.2 the real client sends client_tick_end at the end of every
@@ -124,6 +126,15 @@ async function connect() {
 
   const VERIFICATION_JUMP_THRESHOLD = 8; // blocks — well above max plausible knockback, well below a real teleport
 
+  // ── TEMP DEBUG: confirm whether the server sends the bot a velocity ─────
+  // packet at all when hit. Remove once we know which side the knockback
+  // problem is actually on.
+  bot._client.on('entity_velocity', (packet) => {
+    if (bot.entity && packet.entityId === bot.entity.id) {
+      logger.log(`[Debug] Self velocity packet received: x=${packet.velocity.x} y=${packet.velocity.y} z=${packet.velocity.z}`);
+    }
+  });
+
   bot.on('forcedMove', () => {
     const newPos = bot.entity?.position;
     const jumpDistance = (lastKnownPos && newPos) ? lastKnownPos.distanceTo(newPos) : Infinity;
@@ -139,6 +150,15 @@ async function connect() {
       logger.log('[Sonar] Teleported — letting physics settle...');
       bot.pathfinder.stop();
       ['forward','back','left','right','jump','sprint','sneak'].forEach(k => bot.setControlState(k, false));
+      // Disable physics for ~2 ticks only (not the whole verify window) so
+      // gravity/knockback still work. Closes the gap where mineflayer's local
+      // state is behind the server's chunk data right after a teleport.
+      bot.physicsEnabled = false;
+      clearTimeout(state.handles.physicsResumeTimeout);
+      state.handles.physicsResumeTimeout = setTimeout(() => {
+        bot.physicsEnabled = true;
+        state.handles.physicsResumeTimeout = null;
+      }, 150);
     }
     // Once a verification window is already open, any further forcedMove —
     // regardless of size — extends it. Debounced into one timer instead of
@@ -209,6 +229,15 @@ async function connect() {
     movements.allow1by1towers  = false;
     movements.scafoldingBlocks = [];
     bot.pathfinder.setMovements(movements);
+    // Default is unlimited (-1): with digging/towers off above, getting
+    // around an obstacle means a real detour (not a shortcut through it),
+    // and A* will fully explore every possible detour before picking one —
+    // that's the actual cost driver, not per-tick compute speed. Capping
+    // this stops it considering routes much longer than the direct
+    // distance. Goals that genuinely need a longer detour still work, just
+    // slower to resolve; past this radius, [Move] reports noPath instead
+    // of hanging silently.
+    bot.pathfinder.searchRadius = 32;
 
     bus.emit('status', { connected: true, reconnecting: false, username: bot.username, version: bot.version, ...state.publicConfig() });
     if (!state.getConfig().password) state.flags.loggedIn = true;
@@ -249,6 +278,7 @@ async function connect() {
     if (lower.includes('bot verification')) logger.log('[Sonar] ⚠  Failed: gravity/main check');
     else if (lower.includes('too many'))    logger.log('[Sonar] ⚠  Failed: reconnect rate-limit — backing off');
     else if (lower.includes('captcha'))     logger.log('[Sonar] ⚠  Failed: CAPTCHA (map-image)');
+    else if (lower.includes('resource pack')) logger.log('[ResourcePack] ⚠  Kicked over the resource pack — see [ResourcePack] lines above for what was offered.');
   });
 
   bot.on('end', (reason) => {

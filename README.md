@@ -18,6 +18,7 @@ src/
   config.js             interactive setup wizard, bot-config.json load/save
   connection.js          owns the mineflayer connection: connect/reconnect, protocol
                         compat shims, auth + Sonar /verify chat handling
+  resourcepack.js         resource pack handshake (accept + detailed logging)
   features.js            anti-AFK, camera, auto-eat, combat — all read state.getBot()
                         fresh instead of closing over a bot reference
   commands.js             .move / .attack / .help / toggles / .stats / .config / .quit
@@ -121,6 +122,18 @@ reading the code — see the relevant comments in `src/connection.js` and
   the previous round — never runs anymore, since `version` is now always a
   concrete string. That crash is avoided structurally rather than just
   absorbed; the absorbing listener stays as cheap insurance regardless.
+- **Bot hung/failed to join on servers requiring a resource pack.** Root
+  cause confirmed by reading mineflayer's own plugin source
+  (`lib/plugins/resource_pack.js`): it parses the server's offer and
+  exposes `bot.acceptResourcePack()`, but never calls it automatically —
+  nothing here was either, so a server with `require-resource-pack=true`
+  was left waiting indefinitely for a response that never came. New
+  `src/resourcepack.js` sends that response (always accept — headless bot
+  has no textures to render either way) and logs every stage using the
+  real field names confirmed against the installed minecraft-data for
+  1.21.8 (`uuid`, `url`, `hash`, `forced`, `promptMessage`). Also tags a
+  resource-pack-related kick message in the existing kicked handler for a
+  clear error if it still fails.
 
 **Architecture:**
 
