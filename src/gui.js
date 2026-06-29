@@ -14,7 +14,12 @@ let io = null;
 // Starts the optional web dashboard. Mirrors the original behavior exactly:
 // if express/socket.io aren't installed, the bot still runs fine headless —
 // we just log that the GUI isn't available instead of crashing the process.
+// Returns a Promise that resolves only once the HTTP server is actually
+// bound and listening. index.js awaits this before calling connect() so
+// the event loop is fully idle — no startup work left to compete with
+// Sonar's gravity check during the critical join window.
 function start() {
+  return new Promise((resolve) => {
   try {
     const http       = require('http');
     const express     = require('express');
@@ -44,13 +49,16 @@ function start() {
     // http.Server emits 'error' asynchronously (e.g. EADDRINUSE) — without
     // a listener for it, that's an uncaught exception that kills the whole
     // process, not just the GUI.
-    srv.on('error', (err) => logger.rawLog(`[GUI] Server error: ${err.message}`));
+    srv.on('error', (err) => { logger.rawLog(`[GUI] Server error: ${err.message}`); resolve(); });
     srv.listen(state.getConfig().guiPort || 3000, () => {
       logger.rawLog(`[GUI] Dashboard → http://localhost:${state.getConfig().guiPort || 3000}`);
+      resolve();
     });
   } catch {
     logger.rawLog('[GUI] Web dashboard not available. Run: npm install express socket.io');
+    resolve();
   }
+  });
 }
 
 // The only place in the whole app that touches socket.io directly. Every
