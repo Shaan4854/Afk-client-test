@@ -37,7 +37,8 @@ setInterval(() => {
   const cfg = await config.getConfig();
   state.setConfig(cfg);
 
-  await gui.start();      // wait until HTTP server is bound before touching the socket
+  await gui.start();                                      // wait until HTTP server is bound
+  await new Promise(r => setTimeout(r, 1500));            // let Node fully settle before connecting
   connection.connect();
 
   const rl = readline.createInterface({ input: process.stdin });
